@@ -70,6 +70,12 @@ func ChatToResponses(chat map[string]any) map[string]any {
 	if v, ok := chat["max_completion_tokens"]; ok {
 		out["max_output_tokens"] = v
 	}
+	// scalar generation params pass through 1:1 (responses names match).
+	for _, k := range []string{"temperature", "top_p", "parallel_tool_calls", "reasoning", "reasoning_effort", "metadata"} {
+		if v, ok := chat[k]; ok {
+			out[k] = v
+		}
+	}
 	if tools, ok := chat["tools"].([]any); ok {
 		var flat []any
 		for _, t := range tools {

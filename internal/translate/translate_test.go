@@ -87,6 +87,26 @@ func TestSSEChunk(t *testing.T) {
 	}
 }
 
+func TestChatParamsPassthrough(t *testing.T) {
+	chat := map[string]any{
+		"model": "m",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+		},
+		"temperature": 0.2, "top_p": 0.9, "parallel_tool_calls": false,
+		"reasoning_effort": "low",
+	}
+	out := translate.ChatToResponses(chat)
+	for _, k := range []string{"temperature", "top_p", "parallel_tool_calls", "reasoning_effort"} {
+		if _, ok := out[k]; !ok {
+			t.Fatalf("missing %s", k)
+		}
+	}
+	if _, ok := out["user"]; ok {
+		t.Fatal("user must not leak")
+	}
+}
+
 func TestToolHistory(t *testing.T) {
 	chat := map[string]any{
 		"model": "m",
