@@ -16,7 +16,7 @@ func TestModelsOpenWhenNoKeys(t *testing.T) {
 	dir := t.TempDir()
 	ks, _ := keys.Open(dir)
 	lm := lanes.New(dir, []string{"de"}, nil, nil, true, 1)
-	up := upstream.NewClient("http://127.0.0.1:9", "", "test", lm)
+	up := upstream.NewClient(lm)
 	s := server.New(ks, lm, up)
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
@@ -44,7 +44,7 @@ func TestModelsRequiresKeyWhenKeysExist(t *testing.T) {
 		t.Fatal(err)
 	}
 	lm := lanes.New(dir, []string{"de"}, nil, nil, true, 1)
-	up := upstream.NewClient("http://127.0.0.1:9", "", "test", lm)
+	up := upstream.NewClient(lm)
 	s := server.New(ks, lm, up)
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()

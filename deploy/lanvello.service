@@ -6,8 +6,7 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/lanvello serve --listen 127.0.0.1:11434 --lanes 5
 Environment=LANVELLO_DATA_DIR=/var/lib/lanvello
-# Environment=LANVELLO_GATEWAY_TOKEN=...
-# Environment=LANVELLO_UPSTREAMS_JSON=[...]
+# Environment=LANVELLO_BASE_URL=https://opencode.ai
 Restart=on-failure
 NoNewPrivileges=true
 

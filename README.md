@@ -1,10 +1,11 @@
 # lanvello
 
-lightweight universal gateway: one localhost port speaks openai-compatible api
-and routes models to configured upstreams (opencode gateway, ikhdev, any
-openai-compatible base), rotating tor egress lanes like lingling when tor is
-present. no opencode cli in the hot path: at runtime it only reuses the login
-token, never spawns the editor cli.
+one local port serving opencode free models over an openai-compatible api.
+no login, no api keys from you: lanvello replays the official client
+fingerprint (`opencode/*` user-agent, `x-opencode-*` session headers,
+forced streaming, bash/glob/grep/read tool quartet) against
+`https://opencode.ai/zen/v1` with `Bearer public`, exactly like the cli
+does for its free tier. tor lanes rotate exits when an ip is throttled.
 
 ```
 go build -o bin/lanvello ./cmd/lanvello
@@ -19,38 +20,33 @@ any harness that accepts an openai-compatible provider then uses:
 ```
 baseURL: http://127.0.0.1:11434/v1
 apiKey:  sk-lanv-...
-model:   ikhdev/free-mimo-v2.6-cline   # or opencode/<id> via gateway token
+model:   opencode/muse-spark-1.3-contributor-free
 ```
 
 ## endpoints
 
-- `GET /v1/models` — static catalog of known free ids + `lanvello/auto`
-- `POST /v1/chat/completions` — openai chat, sse passthrough
-- `POST /v1/responses` — same handler (openai responses-style bodies pass through)
-- `POST /v1/messages` — minimal anthropic -> openai mapping, then same path
+- `GET /v1/models` — free ids (`muse-spark-*-contributor-free`,
+  `union-alpha`, `jev-1.13-free`, `longcat/space-bunny/fledge/mimo/ling/nemotron`
+  free builds)
+- `POST /v1/chat/completions` — openai chat. responses-backed models
+  (muse-spark) are translated chat -> responses upstream and back to
+  openai sse (or aggregated when `stream:false`); the rest pass through
+  to `/zen/v1/chat/completions`
+- `POST /v1/responses` — native responses passthrough to
+  `/zen/v1/responses` (fingerprint injected)
+- `POST /v1/messages` — anthropic-native passthrough (union-alpha)
 - `GET /healthz`
 
 auth: bearer `sk-lanv-...` from `key add`. fresh data dir with zero keys
 runs open (single-user localhost); the moment one key exists, all `/v1/*`
-require it.
+require it. one stable `x-opencode-session` is derived per api key:
+minting a fresh session per request burns free quota into 429s.
 
-## upstreams
-
-model id prefix decides the upstream:
-
-- `ikhdev/...` with `LANVELLO_UPSTREAMS_JSON` entry
-  `{"modelPrefix":"ikhdev/","baseURL":"https://api.ikhdev.xyz/v1","token":"..."}`
-  forwards to `<baseURL>/chat/completions` with the prefix stripped, plain
-  openai headers.
-- anything else goes to the opencode-style gateway
-  `<gatewayURL>/ai/v1/proxy/openai/v1/chat/completions` with
-  `User-Agent: opencode/<version>` spoof headers and `LANVELLO_GATEWAY_TOKEN`
-  (or token auto-read from `~/.local/share/opencode/opencode.db` account
-  created by `opencode auth login`, via the sqlite3 cli, no cgo).
+## limits
 
 429 retires the lane exit until `retry-after` and rotates country, request is
-retried on another lane. 502/503/504 retry on another lane. 500 relays as-is.
-per-request proof goes to `$dataDir/proof.jsonl`.
+retried on another lane. 502/503/504 retry on another lane. per-request
+proof goes to `$dataDir/proof.jsonl`.
 
 ## tor lanes
 
@@ -64,13 +60,14 @@ line 1 primary, line 2 fallback, two-letter codes, `#` comments.
 
 ## deploy
 
-single static binary, state in one dir (`LANVELLO_DATA_DIR`):
+single static binary, one dep (`golang.org/x/net` for socks5), state in
+one dir (`LANVELLO_DATA_DIR`):
 
 ```
 docker build -t lanvello .
 docker run --rm -p 127.0.0.1:11434:11434 \
-  -e LANVELLO_GATEWAY_TOKEN=... -e LANVELLO_UPSTREAMS_JSON='[...]' \
   -v lanvello-state:/state -e LANVELLO_DATA_DIR=/state lanvello
 ```
 
 see `deploy/lanvello.service` for systemd.
+override target with `LANVELLO_BASE_URL` if zen ever moves.

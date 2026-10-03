@@ -1,17 +1,20 @@
-// Package upstream forwards openai-compatible requests to the real gateway
-// while pretending to be the opencode client (user-agent + version),
-// rotating lanes on 429/502/503/504 like lingling.
+// Package upstream forwards requests to the opencode free tier
+// (https://opencode.ai/zen/v1) with the client fingerprint the free gate
+// requires: opencode user-agent, x-opencode-* headers, stream:true and the
+// bash/glob/grep/read tool quartet. No login, Bearer public.
 package upstream
 
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -21,37 +24,93 @@ import (
 	"lanvello/internal/lanes"
 )
 
-type Route struct {
-	URL            string
-	Token          string
-	OpencodeClient bool
+const (
+	ZenBase     = "https://opencode.ai"
+	OpencodeUA  = "opencode/1.18.31"
+	PublicToken = "public"
+)
+
+// ResponsesModels live on /zen/v1/responses, MessagesModels on
+// /zen/v1/messages, everything else on /zen/v1/chat/completions.
+var ResponsesModels = map[string]bool{
+	"muse-spark-1.2-contributor-free": true,
+	"muse-spark-1.3-contributor-free": true,
+}
+
+var MessagesModels = map[string]bool{
+	"union-alpha": true,
+}
+
+func IsResponsesModel(m string) bool { return ResponsesModels[stripThinking(m)] }
+func IsMessagesModel(m string) bool  { return MessagesModels[stripThinking(m)] }
+
+func stripThinking(m string) string {
+	// "model(level)" -> "model"
+	if i := strings.LastIndex(m, "("); i > 0 && strings.HasSuffix(m, ")") {
+		return strings.TrimSpace(m[:i])
+	}
+	return m
 }
 
 type Client struct {
-	GatewayURL string
-	Token      string
-	ClientVer  string
+	BaseURL    string
 	Lanes      *lanes.Manager
 	HTTP       *http.Client
 	WaitBudget time.Duration
-	Ups        []UpstreamSel
+	SessionFor func(identity string) string
+	RequestID  func() string
 }
 
-type UpstreamSel struct {
-	Prefix  string
-	BaseURL string
-	Token   string
-}
-
-func NewClient(gatewayURL, token, clientVer string, m *lanes.Manager) *Client {
+func NewClient(m *lanes.Manager) *Client {
 	return &Client{
-		GatewayURL: strings.TrimRight(gatewayURL, "/"),
-		Token:      token,
-		ClientVer:  clientVer,
+		BaseURL:    ZenBase,
 		Lanes:      m,
-		HTTP:       &http.Client{Timeout: 120 * time.Second},
+		HTTP:       &http.Client{Timeout: 180 * time.Second},
 		WaitBudget: 90 * time.Second,
+		SessionFor: func(identity string) string { return StableSession(identity) },
+		RequestID:  func() string { return NewRequestID() },
 	}
+}
+
+const b62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+func randB62(n int) string {
+	var b [32]byte
+	_, _ = rand.Read(b[:])
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = b62[int(b[i])%62]
+	}
+	return string(out)
+}
+
+// NewSessionID mirrors the cli shape: ses_<12hex><14base62>.
+func NewSessionID() string {
+	var h [6]byte
+	_, _ = rand.Read(h[:])
+	return "ses_" + hex.EncodeToString(h[:]) + randB62(14)
+}
+
+// NewRequestID mirrors the cli shape: msg_<12hex><14base62>.
+func NewRequestID() string {
+	var h [6]byte
+	_, _ = rand.Read(h[:])
+	return "msg_" + hex.EncodeToString(h[:]) + randB62(14)
+}
+
+// StableSession derives one long-lived session per downstream identity:
+// minting a fresh session per request burns free quota into 429s.
+func StableSession(identity string) string {
+	sum := sha256.Sum256([]byte("opencode\x00" + identity))
+	return "ses_" + hex.EncodeToString(sum[:6]) + b62map(sum[6:20])
+}
+
+func b62map(b []byte) string {
+	out := make([]byte, len(b))
+	for i, v := range b {
+		out[i] = b62[int(v)%62]
+	}
+	return string(out)
 }
 
 func (c *Client) clientFor(lane *lanes.Lane) *http.Client {
@@ -67,46 +126,122 @@ func (c *Client) clientFor(lane *lanes.Lane) *http.Client {
 			return dialer.Dial(network, addr)
 		},
 	}
-	return &http.Client{Transport: transport, Timeout: 120 * time.Second}
+	return &http.Client{Transport: transport, Timeout: 180 * time.Second}
 }
 
-// Target maps public model names to upstream paths.
-// Gateway mode (opencode-like): <gateway>/ai/v1/proxy/openai/v1/chat/completions.
-// Generic mode (any openai-compatible base): <baseURL>/chat/completions.
-func (c *Client) route(model string) Route {
-	best := -1
-	for i, u := range c.Ups {
-		if u.Prefix != "" && strings.HasPrefix(model, u.Prefix) && len(u.Prefix) > best {
-			best = len(u.Prefix)
-			_ = i
-		}
+func endpointFor(model string) string {
+	if IsResponsesModel(model) {
+		return "/zen/v1/responses"
 	}
-	for _, u := range c.Ups {
-		if u.Prefix != "" && strings.HasPrefix(model, u.Prefix) && len(u.Prefix) == best && best >= 0 {
-			base := strings.TrimRight(u.BaseURL, "/")
-			if strings.HasSuffix(base, "/v1") {
-				return Route{URL: base + "/chat/completions", Token: u.Token}
+	if IsMessagesModel(model) {
+		return "/zen/v1/messages"
+	}
+	return "/zen/v1/chat/completions"
+}
+
+// FingerprintTools appends the missing bash/glob/grep/read decoys.
+// flat=false is chat shape, flat=true is responses shape.
+func FingerprintTools(body map[string]any, flat bool) {
+	present := map[string]bool{}
+	var list []any
+	if arr, ok := body["tools"].([]any); ok {
+		list = arr
+		for _, t := range arr {
+			if n := toolName(t); n != "" {
+				present[strings.ToLower(n)] = true
 			}
-			return Route{URL: base + "/v1/chat/completions", Token: u.Token}
 		}
 	}
-	return Route{URL: c.GatewayURL + "/ai/v1/proxy/openai/v1/chat/completions", Token: c.Token, OpencodeClient: true}
+	for _, name := range []string{"bash", "glob", "grep", "read"} {
+		if present[name] {
+			continue
+		}
+		if flat {
+			list = append(list, map[string]any{
+				"type": "function", "name": name,
+				"description": "This tool is currently unavailable and must not be used.",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			})
+		} else {
+			list = append(list, map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        name,
+					"description": "This tool is currently unavailable and must not be used.",
+					"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+				},
+			})
+		}
+	}
+	body["tools"] = list
+	if _, ok := body["tool_choice"]; !ok && !flat {
+		body["tool_choice"] = "none"
+	}
 }
 
-func (c *Client) openAIURL() string { return c.GatewayURL + "/ai/v1/proxy/openai/v1/chat/completions" }
+func toolName(t any) string {
+	m, ok := t.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if n, ok := m["name"].(string); ok && n != "" {
+		return strings.TrimSpace(n)
+	}
+	if fn, ok := m["function"].(map[string]any); ok {
+		if n, ok := fn["name"].(string); ok {
+			return strings.TrimSpace(n)
+		}
+	}
+	return ""
+}
 
-func (c *Client) Do(model string, w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+// Do forwards one request with lane rotation. identity scopes the stable
+// session (use the caller api key). streamUp forces sse upstream.
+func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), 400)
 		return
 	}
-	// model lives in the json body; query param is only a fallback.
-	if m := bodyModel(body); m != "" {
+	if m := bodyModel(raw); m != "" {
 		model = m
 	}
-	isStream := strings.Contains(string(body), `"stream":true`) || strings.Contains(string(body), `"stream": true`)
-	_ = isStream
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	flat := IsResponsesModel(model)
+	body["model"] = stripThinking(model)
+	body["stream"] = true
+	if flat {
+		body["store"] = false
+		if _, ok := body["input"]; !ok {
+			http.Error(w, "responses requires input", 400)
+			return
+		}
+	} else if !IsMessagesModel(model) {
+		if _, ok := body["messages"]; !ok {
+			http.Error(w, "chat requires messages", 400)
+			return
+		}
+	}
+	FingerprintTools(body, flat)
+	fwd, err := json.Marshal(body)
+	if err != nil {
+		http.Error(w, "encode", 500)
+		return
+	}
+	status, hdr, respBody := c.Raw(model, identity, fwd, r.Header)
+	relay(w, status, hdr, respBody)
+}
+
+// Raw sends a prepared upstream body with lane rotation and returns the raw
+// upstream answer (sse bytes). It calls w only on total lane failure.
+func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, http.Header, []byte) {
+	url := c.BaseURL + endpointFor(model)
+	session := c.SessionFor(identity)
+	reqID := c.RequestID()
 
 	tried := map[int]bool{}
 	deadline := time.Now().Add(c.WaitBudget)
@@ -115,26 +250,19 @@ func (c *Client) Do(model string, w http.ResponseWriter, r *http.Request) {
 		lane := c.Lanes.Pick(tried)
 		if lane == nil {
 			if time.Now().After(deadline) {
-				http.Error(w, "no lane available"+suffix(lastErr), 502)
-				return
+				h := http.Header{}
+				h.Set("Content-Type", "application/json")
+				return 502, h, []byte(`{"error":"no lane available` + suffix(lastErr) + `"}`)
 			}
 			time.Sleep(500 * time.Millisecond)
 			tried = map[int]bool{}
 			continue
 		}
 		tried[lane.Index] = true
-		rt := c.route(model)
-		outBody := body
-		if !rt.OpencodeClient {
-			if stripped, ok := stripPrefix(model, c.Ups); ok {
-				outBody = swapModel(body, model, stripped)
-			}
-		}
-		status, hdr, respBody, rerr := c.roundTrip(lane, rt, outBody, r.Header)
+		status, hdr, respBody, rerr := c.roundTrip(lane, url, session, reqID, fwd, in)
 		if rerr != nil {
 			lastErr = rerr.Error()
 			c.Lanes.Release(lane)
-			// dial failure: try next lane immediately
 			continue
 		}
 		c.Lanes.Release(lane)
@@ -148,92 +276,41 @@ func (c *Client) Do(model string, w http.ResponseWriter, r *http.Request) {
 		case status == 502 || status == 503 || status == 504:
 			continue
 		case status == 500:
-			relay(w, status, hdr, respBody)
-			c.Lanes.NoteResult(lane.Country, status)
-			return
+			// Chat-path 500s are transient far-end failures; rotate once.
+			if len(tried) < len(c.Lanes.Lanes()) {
+				continue
+			}
+			return status, hdr, respBody
 		default:
-			relay(w, status, hdr, respBody)
 			c.Lanes.NoteResult(lane.Country, status)
 			c.Lanes.Emit(lanes.Proof{T: time.Now(), Lane: lane.Index, Country: lane.Country, IP: lane.ExitIP, Model: model, Status: status, Bytes: int64(len(respBody))})
-			return
+			return status, hdr, respBody
 		}
 	}
 }
 
-func suffix(s string) string {
-	if s == "" {
-		return ""
-	}
-	return ": " + s
-}
-
-// bodyModel extracts the top-level "model" field without full decode.
-func bodyModel(body []byte) string {
-	var v struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &v); err != nil {
-		return ""
-	}
-	return v.Model
-}
-
-// stripPrefix returns the model id without the matched upstream prefix.
-func stripPrefix(model string, ups []UpstreamSel) (string, bool) {
-	best := -1
-	for _, u := range ups {
-		if u.Prefix != "" && strings.HasPrefix(model, u.Prefix) && len(u.Prefix) > best {
-			best = len(u.Prefix)
-		}
-	}
-	if best < 0 {
-		return model, false
-	}
-	return strings.TrimPrefix(model[best:], "/"), true
-}
-
-// swapModel replaces the exact "model":"from" occurrence with "to".
-func swapModel(body []byte, from, to string) []byte {
-	old1 := `"model":"` + from + `"`
-	new1 := `"model":"` + to + `"`
-	if strings.Contains(string(body), old1) {
-		return []byte(strings.Replace(string(body), old1, new1, 1))
-	}
-	old2 := `"model": "` + `"` + from + `"`
-	if strings.Contains(string(body), `"model":`) {
-		_ = old2
-		// spaced variant: rebuild via minimal parse is overkill; string replace both spacings.
-		s := strings.Replace(string(body), `"model" :"`+`"`+from+`"`, new1, 1)
-		s = strings.Replace(s, `"model": "`+`"`+from+`"`, new1, 1)
-		return []byte(s)
-	}
-	return body
-}
-
-func (c *Client) roundTrip(lane *lanes.Lane, rt Route, body []byte, in http.Header) (int, http.Header, []byte, error) {
+func (c *Client) roundTrip(lane *lanes.Lane, url, session, reqID string, body []byte, in http.Header) (int, http.Header, []byte, error) {
 	hc := c.clientFor(lane)
-	req, err := http.NewRequest("POST", rt.URL, strings.NewReader(string(body)))
+	req, err := http.NewRequest("POST", url, bytesReader(body))
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if rt.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+rt.Token)
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+PublicToken)
+	ua := in.Get("User-Agent")
+	if !validOpencodeUA(ua) {
+		ua = OpencodeUA
 	}
-	if rt.OpencodeClient {
-		// pretend to be opencode cli, not a generic script
-		ua := "opencode/" + c.ClientVer
-		if c.ClientVer == "" {
-			ua = "opencode/unknown"
-		}
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("X-Client-Version", c.ClientVer)
-		req.Header.Set("X-Opencode-Client", "lanvello")
+	req.Header.Set("User-Agent", ua)
+	if v := in.Get("x-opencode-client"); v != "" {
+		req.Header.Set("x-opencode-client", v)
+	} else {
+		req.Header.Set("x-opencode-client", "desktop")
 	}
-	if v := in.Get("X-Request-Id"); v != "" {
-		req.Header.Set("X-Request-Id", v)
-	}
-	start := time.Now()
+	req.Header.Set("x-opencode-session", session)
+	req.Header.Set("x-opencode-request", reqID)
+	req.Header.Set("x-opencode-project", "global")
 	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
@@ -243,8 +320,22 @@ func (c *Client) roundTrip(lane *lanes.Lane, rt Route, body []byte, in http.Head
 	if err != nil {
 		return resp.StatusCode, resp.Header, nil, err
 	}
-	_ = start
 	return resp.StatusCode, resp.Header, b, nil
+}
+
+func validOpencodeUA(ua string) bool {
+	s := strings.ToLower(ua)
+	i := strings.Index(s, "opencode/")
+	if i < 0 {
+		return false
+	}
+	rest := s[i+len("opencode/"):]
+	var major, minor int
+	n, _ := fmt.Sscanf(rest, "%d.%d", &major, &minor)
+	if n < 2 {
+		return false
+	}
+	return major > 1 || (major == 1 && minor >= 17)
 }
 
 func relay(w http.ResponseWriter, status int, hdr http.Header, body []byte) {
@@ -275,42 +366,39 @@ func parseRetryAfter(v string) time.Duration {
 	return 0
 }
 
-// DialCheck verifies a socks addr answers; used by demo/lanes status.
-func DialCheck(socksAddr, target string, timeout time.Duration) error {
-	if socksAddr == "" {
-		u, err := url.Parse(target)
-		if err != nil {
-			return err
-		}
-		host := u.Host
-		if _, _, err := net.SplitHostPort(host); err != nil {
-			host = net.JoinHostPort(host, "443")
-		}
-		c, err := net.DialTimeout("tcp", host, timeout)
-		if err != nil {
-			return err
-		}
-		return c.Close()
+func suffix(s string) string {
+	if s == "" {
+		return ""
 	}
-	d, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
-	if err != nil {
-		return err
+	return ": " + s
+}
+
+func bodyModel(body []byte) string {
+	var v struct {
+		Model string `json:"model"`
 	}
-	u, err := url.Parse(target)
-	if err != nil {
-		return err
+	if err := json.Unmarshal(body, &v); err != nil {
+		return ""
 	}
-	host := u.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		host = net.JoinHostPort(host, "443")
+	return v.Model
+}
+
+type readerFunc struct{}
+
+func bytesReader(b []byte) io.Reader { return &byteReader{b: b} }
+
+type byteReader struct {
+	b []byte
+	i int
+}
+
+func (r *byteReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.b) {
+		return 0, io.EOF
 	}
-	c, err := d.Dial("tcp", host)
-	if err != nil {
-		return err
-	}
-	_ = c.Close()
-	return nil
+	n := copy(p, r.b[r.i:])
+	r.i += n
+	return n, nil
 }
 
 var _ = bufio.ErrTooLong
-var _ = fmt.Sprint

@@ -2,14 +2,10 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,7 +44,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`lanvello - lightweight universal gateway
+	fmt.Println(`lanvello - opencode free models over one local openai-compatible port
 usage:
   lanvello serve [--listen 127.0.0.1:11434] [--lanes 5] [--no-tor] [--config file.json]
   lanvello key add --name aider
@@ -59,7 +55,7 @@ usage:
   lanvello tui`)
 }
 
-func baseConfig(args []string) (config.Config, string) {
+func baseConfig(args []string) config.Config {
 	fs := flag.NewFlagSet("base", flag.ContinueOnError)
 	listen := fs.String("listen", "", "listen addr")
 	ln := fs.Int("lanes", 0, "lane count")
@@ -92,13 +88,7 @@ func baseConfig(args []string) (config.Config, string) {
 		fmt.Fprintln(os.Stderr, "config error: "+err.Error())
 		os.Exit(1)
 	}
-	// opencode token auto-discovery: explicit env wins, else opencode.db account.
-	if cfg.GatewayTok == "" {
-		if t := discoverOpencodeToken(); t != "" {
-			cfg.GatewayTok = t
-		}
-	}
-	return cfg, cfg.DataDir
+	return cfg
 }
 
 func openDeps(cfg config.Config) (*keys.Store, *lanes.Manager) {
@@ -117,21 +107,16 @@ func openDeps(cfg config.Config) (*keys.Store, *lanes.Manager) {
 }
 
 func cmdServe(args []string) {
-	cfg, _ := baseConfig(args)
+	cfg := baseConfig(args)
 	ks, m := openDeps(cfg)
 	if !cfg.NoTor && len(cfg.Socks) == 0 {
 		tor.Ensure(m, cfg.DataDir, 52001, 52301, 60*time.Second)
 	}
-	up := upstream.NewClient(cfg.GatewayURL, cfg.GatewayTok, cfg.ClientVer, m)
+	up := upstream.NewClient(m)
+	up.BaseURL = cfg.BaseURL
 	up.WaitBudget = time.Duration(cfg.WaitBudgetS * float64(time.Second))
-	for _, u := range loadUpstreams(cfg) {
-		up.Ups = append(up.Ups, upstream.UpstreamSel{Prefix: u.ModelPref, BaseURL: u.BaseURL, Token: u.Token})
-	}
 	srv := server.New(ks, m, up)
-	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor=%v\n", version, cfg.Listen, cfg.Lanes, !cfg.NoTor)
-	if cfg.GatewayTok == "" {
-		fmt.Println("warn: no gateway token found; set LANVELLO_GATEWAY_TOKEN or run opencode auth login")
-	}
+	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor=%v free-only, no login\n", version, cfg.Listen, cfg.Lanes, !cfg.NoTor)
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -143,7 +128,7 @@ func cmdKey(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: lanvello key add|list|revoke")
 		os.Exit(2)
 	}
-	cfg, _ := baseConfig([]string{})
+	cfg := baseConfig([]string{})
 	ks, _ := openDeps(cfg)
 	switch args[0] {
 	case "add":
@@ -180,7 +165,7 @@ func cmdKey(args []string) {
 }
 
 func cmdLanes(args []string) {
-	cfg, _ := baseConfig([]string{})
+	cfg := baseConfig([]string{})
 	_, m := openDeps(cfg)
 	for _, l := range m.Lanes() {
 		fmt.Printf("lane %d cc=%s socks=%s healthy=%v active=%d score=%d\n",
@@ -193,16 +178,12 @@ func cmdDemo(args []string) {
 	if len(args) > 0 {
 		q = strings.Join(args, " ")
 	}
-	cfg, _ := baseConfig([]string{})
-	_, m := openDeps(cfg)
-	up := upstream.NewClient(cfg.GatewayURL, cfg.GatewayTok, cfg.ClientVer, m)
-	_ = up
 	_ = q
-	fmt.Println("demo needs a running server with gateway token; use: curl http://127.0.0.1:11434/v1/models")
+	fmt.Println("demo needs a running server; use: curl http://127.0.0.1:11434/v1/models")
 }
 
 func cmdTui(args []string) {
-	cfg, _ := baseConfig(args)
+	cfg := baseConfig(args)
 	_, m := openDeps(cfg)
 	// lite tui: 3 refreshes of lane table, no external deps.
 	for i := 0; i < 3; i++ {
@@ -215,33 +196,4 @@ func cmdTui(args []string) {
 			time.Sleep(2 * time.Second)
 		}
 	}
-}
-
-// loadUpstreams merges file config with LANVELLO_UPSTREAMS_JSON env.
-func loadUpstreams(cfg config.Config) []config.Upstream {
-	out := append([]config.Upstream{}, cfg.Upstreams...)
-	if raw := os.Getenv("LANVELLO_UPSTREAMS_JSON"); raw != "" {
-		var extra []config.Upstream
-		if err := json.Unmarshal([]byte(raw), &extra); err == nil {
-			out = append(out, extra...)
-		}
-	}
-	return out
-}
-
-// discoverOpencodeToken reuses `opencode auth login` session without
-// running the cli at request time: reads the newest account access_token
-// via the sqlite3 cli (stdlib only, no cgo/sqlite driver).
-func discoverOpencodeToken() string {
-	home, _ := os.UserHomeDir()
-	db := filepath.Join(home, ".local", "share", "opencode", "opencode.db")
-	if _, err := os.Stat(db); err != nil {
-		return ""
-	}
-	out, err := exec.Command("sqlite3", db,
-		"select access_token from account order by time_updated desc limit 1;").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(bytes.TrimSpace(out)))
 }

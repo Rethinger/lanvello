@@ -7,26 +7,17 @@ import (
 	"path/filepath"
 )
 
-type Upstream struct {
-	Name      string `json:"name"`
-	BaseURL   string `json:"baseURL"`
-	Token     string `json:"token"`
-	ModelPref string `json:"modelPrefix"`
-}
 type Config struct {
-	Listen      string     `json:"listen"`
-	Lanes       int        `json:"lanes"`
-	NoTor       bool       `json:"noTor"`
-	DataDir     string     `json:"dataDir"`
-	GatewayURL  string     `json:"gatewayURL"`
-	GatewayTok  string     `json:"gatewayToken"`
-	ClientVer   string     `json:"clientVersion"`
-	Socks       []string   `json:"socks"`
-	Countries   []string   `json:"countries"`
-	Fallback    []string   `json:"fallbackCountries"`
-	Upstreams   []Upstream `json:"upstreams"`
-	RequireKey  bool       `json:"requireKey"`
-	WaitBudgetS float64    `json:"waitBudgetS"`
+	Listen      string   `json:"listen"`
+	Lanes       int      `json:"lanes"`
+	NoTor       bool     `json:"noTor"`
+	DataDir     string   `json:"dataDir"`
+	BaseURL     string   `json:"baseURL"`
+	ClientVer   string   `json:"clientVersion"`
+	Socks       []string `json:"socks"`
+	Countries   []string `json:"countries"`
+	Fallback    []string `json:"fallbackCountries"`
+	WaitBudgetS float64  `json:"waitBudgetS"`
 }
 
 func DefaultDataDir() string {
@@ -45,9 +36,8 @@ func Defaults() Config {
 		Listen:      "127.0.0.1:11434",
 		Lanes:       5,
 		DataDir:     DefaultDataDir(),
-		GatewayURL:  envOr("LANVELLO_GATEWAY_URL", "https://api.opencode.ai"),
-		GatewayTok:  os.Getenv("LANVELLO_GATEWAY_TOKEN"),
-		ClientVer:   envOr("LANVELLO_CLIENT_VERSION", "v0.0.0-dev-20455"),
+		BaseURL:     envOr("LANVELLO_BASE_URL", "https://opencode.ai"),
+		ClientVer:   envOr("LANVELLO_CLIENT_VERSION", "1.18.31"),
 		Countries:   []string{"us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"},
 		WaitBudgetS: 90,
 	}
@@ -76,7 +66,6 @@ func LoadFile(path string, base Config) (Config, error) {
 	if err := json.Unmarshal(b, &f); err != nil {
 		return base, err
 	}
-	// merge non-zero values
 	if f.Listen != "" {
 		base.Listen = f.Listen
 	}
@@ -86,11 +75,8 @@ func LoadFile(path string, base Config) (Config, error) {
 	if f.DataDir != "" {
 		base.DataDir = f.DataDir
 	}
-	if f.GatewayURL != "" {
-		base.GatewayURL = f.GatewayURL
-	}
-	if f.GatewayTok != "" {
-		base.GatewayTok = f.GatewayTok
+	if f.BaseURL != "" {
+		base.BaseURL = f.BaseURL
 	}
 	if f.ClientVer != "" {
 		base.ClientVer = f.ClientVer
@@ -103,12 +89,6 @@ func LoadFile(path string, base Config) (Config, error) {
 	}
 	if len(f.Fallback) > 0 {
 		base.Fallback = f.Fallback
-	}
-	if len(f.Upstreams) > 0 {
-		base.Upstreams = f.Upstreams
-	}
-	if f.RequireKey {
-		base.RequireKey = true
 	}
 	if f.WaitBudgetS > 0 {
 		base.WaitBudgetS = f.WaitBudgetS

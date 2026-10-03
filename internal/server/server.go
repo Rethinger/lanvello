@@ -1,15 +1,18 @@
-// Package server exposes the universal openai-compatible api.
+// Package server exposes the universal openai-compatible api backed only by
+// the opencode free tier (no login, fingerprinted as the official client).
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"lanvello/internal/keys"
 	"lanvello/internal/lanes"
+	"lanvello/internal/translate"
 	"lanvello/internal/upstream"
 )
 
@@ -28,9 +31,20 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("/healthz", s.health)
 	m.HandleFunc("/v1/models", s.models)
 	m.HandleFunc("/v1/chat/completions", s.chat)
-	m.HandleFunc("/v1/responses", s.chat)
-	m.HandleFunc("/v1/messages", s.anthropic)
+	m.HandleFunc("/v1/responses", s.responses)
+	m.HandleFunc("/v1/messages", s.messages)
 	return m
+}
+
+func (s *Server) identity(r *http.Request) string {
+	sec := keys.BearerOf(r.Header.Get("Authorization"))
+	if sec == "" {
+		sec = r.URL.Query().Get("api_key")
+	}
+	if sec == "" {
+		return "anon"
+	}
+	return sec
 }
 
 func (s *Server) authed(r *http.Request) bool {
@@ -49,10 +63,21 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, `{"ok":true,"name":"lanvello"}`+"\n")
 }
 
-type modelEnt struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	OwnedBy string `json:"owned_by"`
+var freeModels = []string{
+	"opencode/muse-spark-1.3-contributor-free",
+	"opencode/muse-spark-1.2-contributor-free",
+	"opencode/union-alpha",
+	"opencode/jev-1.13-free",
+	"opencode/longcat-2.5-preview-free",
+	"opencode/space-bunny-free",
+	"opencode/fledge-alpha-free",
+	"opencode/mimo-v2.6-flash-free",
+	"opencode/mimo-v2.5-free",
+	"opencode/ling-3.1-flash-free",
+	"opencode/ling-3.0-flash-fin-free",
+	"opencode/nemotron-3-ultra-free",
+	"opencode/nemotron-3.5-lightning-free",
+	"opencode/big-pickle",
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
@@ -64,18 +89,28 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	mods := []modelEnt{
-		{ID: "opencode/muse-spark-1.3-contributor-free", Object: "model", OwnedBy: "opencode"},
-		{ID: "opencode/muse-spark-1.2-free", Object: "model", OwnedBy: "opencode"},
-		{ID: "opencode/longcat-2.5-preview-free", Object: "model", OwnedBy: "opencode"},
-		{ID: "opencode/nemotron-3-ultra-free", Object: "model", OwnedBy: "opencode"},
-		{ID: "opencode/space-bunny-free", Object: "model", OwnedBy: "opencode"},
-		{ID: "lanvello/auto", Object: "model", OwnedBy: "lanvello"},
+	type ent struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		OwnedBy string `json:"owned_by"`
+	}
+	var mods []ent
+	for _, id := range freeModels {
+		mods = append(mods, ent{ID: id, Object: "model", OwnedBy: "opencode"})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": mods})
 }
 
+func shortID(id string) string {
+	if i := strings.Index(id, "/"); i >= 0 {
+		return id[i+1:]
+	}
+	return id
+}
+
+// chat serves openai chat completions. Responses-backed models are translated
+// chat -> responses upstream and back, the rest pass through natively.
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", 405)
@@ -85,12 +120,80 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	model := sniffModel(r)
-	s.Up.Do(model, w, r)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body", 400)
+		return
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(raw, &chat); err != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	model, _ := chat["model"].(string)
+	model = shortID(model)
+	if model == "" {
+		model = "muse-spark-1.3-contributor-free"
+		chat["model"] = model
+	}
+	wantStream, _ := chat["stream"].(bool)
+	if !upstream.IsResponsesModel(model) {
+		// native chat/messages path: forward as-is with fingerprint.
+		nr, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(raw))
+		nr.Header = r.Header.Clone()
+		s.Up.Do(model, s.identity(r), w, nr)
+		return
+	}
+	respBody := translate.ChatToResponses(chat)
+	respBody["model"] = model
+	upstream.FingerprintTools(respBody, true)
+	fwd, _ := json.Marshal(respBody)
+	status, hdr, body := s.Up.Raw(model, s.identity(r), fwd, r.Header)
+	if status != 200 || !isSSE(hdr, body) {
+		pass(w, status, hdr, body)
+		return
+	}
+	if !wantStream {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write(translate.AggregateResponses(body, "opencode/"+model))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(200)
+	fl, _ := w.(http.Flusher)
+	sc := bufio.NewScanner(bytes.NewReader(body))
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			break
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+			continue
+		}
+		lines, done := translate.ResponsesSSEToOpenAI(ev, "opencode/"+model)
+		for _, l := range lines {
+			io.WriteString(w, l+"\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if done {
+			break
+		}
+	}
 }
 
-// anthropic accepts native messages format and maps it minimally to chat.
-func (s *Server) anthropic(w http.ResponseWriter, r *http.Request) {
+// responses passes native responses clients straight through.
+func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", 405)
 		return
@@ -99,85 +202,33 @@ func (s *Server) anthropic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	b, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body", 400)
+	s.Up.Do("", s.identity(r), w, r)
+}
+
+// messages passes anthropic-native bodies (union-alpha) straight through.
+func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
 		return
 	}
-	var in struct {
-		Model     string `json:"model"`
-		Stream    bool   `json:"stream"`
-		System    any    `json:"system"`
-		Messages  any    `json:"messages"`
-		MaxTokens *int   `json:"max_tokens"`
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", 401)
+		return
 	}
-	_ = json.Unmarshal(b, &in)
-	model := in.Model
-	if model == "" {
-		model = "lanvello/auto"
-	}
-	msgs := "[]"
-	if in.Messages != nil {
-		if mb, err := json.Marshal(in.Messages); err == nil {
-			msgs = string(mb)
+	s.Up.Do("union-alpha", s.identity(r), w, r)
+}
+
+func isSSE(hdr http.Header, body []byte) bool {
+	ct := hdr.Get("Content-Type")
+	return strings.Contains(ct, "text/event-stream") || bytes.Contains(body, []byte("event:"))
+}
+
+func pass(w http.ResponseWriter, status int, hdr http.Header, body []byte) {
+	for _, k := range []string{"Content-Type", "Retry-After"} {
+		if v := hdr.Get(k); v != "" {
+			w.Header().Set(k, v)
 		}
 	}
-	sys := ""
-	if in.System != nil {
-		if sb, err := json.Marshal(in.System); err == nil {
-			sys = string(sb)
-		}
-	}
-	maxT := 1024
-	if in.MaxTokens != nil {
-		maxT = *in.MaxTokens
-	}
-	openai := `{"model":` + quote(model) + `,"messages":[{"role":"system","content":` + quote(sys) + `},{"role":"user","content":` + quote(msgs) + `}],"max_tokens":` + itoa(maxT) + `,"stream":` + boolStr(in.Stream) + `}`
-	req, _ := http.NewRequest("POST", "/v1/chat/completions", strings.NewReader(openai))
-	req.Header = r.Header.Clone()
-	s.Up.Do(model, w, req)
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
-
-func sniffModel(r *http.Request) string {
-	// body already consumed by upstream.Do; best effort from query.
-	if m := r.URL.Query().Get("model"); m != "" {
-		return m
-	}
-	return "lanvello/auto"
-}
-
-func quote(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
-}
-
-var _ = time.Now
