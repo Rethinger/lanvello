@@ -25,17 +25,41 @@ model:   opencode/muse-spark-1.3-contributor-free
 
 ## endpoints
 
-- `GET /v1/models` — free ids (`muse-spark-*-contributor-free`,
-  `union-alpha`, `jev-1.13-free`, `longcat/space-bunny/fledge/mimo/ling/nemotron`
-  free builds)
+- `GET /v1/models` — the live free catalog, fetched upstream through a lane
+  and cached for a minute; only ids the free tier actually serves are
+  advertised (`union-alpha` and `jev-1.13-free` are not among them)
 - `POST /v1/chat/completions` — openai chat. responses-backed models
   (muse-spark) are translated chat -> responses upstream and back to
   openai sse (or aggregated when `stream:false`); the rest pass through
   to `/zen/v1/chat/completions`
 - `POST /v1/responses` — native responses passthrough to
   `/zen/v1/responses` (fingerprint injected)
-- `POST /v1/messages` — anthropic-native passthrough (union-alpha)
+- `POST /v1/messages` — anthropic-native. body, tools, tool_choice and
+  `thinking.budget_tokens` are translated to openai chat upstream and the
+  answer comes back as an anthropic message or as the full anthropic sse
+  sequence (`message_start` … `message_stop`). unknown model names
+  (`claude-*`) land on the default free model instead of failing.
 - `GET /healthz`
+
+unknown model ids are substituted with the default free model rather than
+passed upstream, so a harness configured for another provider still works.
+
+## streaming and usage
+
+streams are relayed event by event with a flush per event — the first token
+reaches the client while the model is still generating (no buffering of the
+whole answer). `stream:false` aggregates the same stream into one completion
+and keeps `id`, `created` and the full `usage` object, including
+`completion_tokens_details.reasoning_tokens`.
+
+effort is passed through in the spelling each endpoint accepts:
+`reasoning_effort` on chat/messages, `reasoning{effort,summary}` on
+responses. `thinking.budget_tokens` from anthropic bodies is folded into
+`reasoning_effort`. effort is observable in the returned usage: the same
+prompt on `muse-spark-1.3` costs ~40 reasoning tokens at `minimal` and
+~600 at `high`. reasoning text is only visible where upstream sends it in
+the clear (`reasoning_content` on chat models); the responses path ships
+reasoning encrypted, so there only the token counts show up.
 
 auth: bearer `sk-lanv-...` from `key add`. fresh data dir with zero keys
 runs open (single-user localhost); the moment one key exists, all `/v1/*`
@@ -47,6 +71,14 @@ minting a fresh session per request burns free quota into 429s.
 429 retires the lane exit until `retry-after` and rotates country, request is
 retried on another lane. 502/503/504 retry on another lane. per-request
 proof goes to `$dataDir/proof.jsonl`.
+
+a lane stays busy for the whole answer, not just while the request is in
+flight, so N lanes means N concurrent answers; the rest wait in the queue up
+to `waitBudgetS` (default 90) and `/v1/models` up to `catalogBudgetS`
+(default 20). timeouts are split: 3 minutes for response headers, 10 minutes
+without any bytes in flight — a model that thinks for a long time is not cut,
+a dead socket is not waited on forever. if the client hangs up mid-stream the
+upstream request is closed instead of running to completion for free.
 
 ## tor lanes
 
@@ -60,10 +92,14 @@ tor lane the server refuses to start. an explicit socks list in config
 `countries.txt` in the data dir overrides pools like lingling:
 line 1 primary, line 2 fallback, two-letter codes, `#` comments.
 
-per-model exits: `modelLanes: {"union-alpha": "us"}` in config pins a
-model family to an exit country (union-alpha only serves us exits);
-requests for other models use the least-loaded lane. 429 handling is
-per exit ip with `retry-after` respected, exactly the free-tier bypass.
+per-model exits: `modelLanes: {"fledge-alpha-free": "de"}` in config pins a
+model family to an exit country; requests for other models use the
+least-loaded lane. 429 handling is per exit ip with `retry-after` respected,
+exactly the free-tier bypass. note that a lane held by a long answer cannot
+answer a catalog call until it frees up, hence `catalogBudgetS`.
+
+every byte leaves through a lane, including the model catalog: there is no
+code path in `internal/upstream` that dials the free tier directly.
 
 ## deploy
 

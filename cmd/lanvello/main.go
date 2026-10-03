@@ -123,7 +123,10 @@ func cmdServe(args []string) {
 	up := upstream.NewClient(m)
 	up.BaseURL = cfg.BaseURL
 	up.WaitBudget = time.Duration(cfg.WaitBudgetS * float64(time.Second))
-	up.WantCountry = map[string]string{"union-alpha": "us"}
+	up.CatalogBudget = time.Duration(cfg.CatalogBudgetS * float64(time.Second))
+	// per-model exit pins come from config only: the free tier serves nothing
+	// that needs a specific country today, and a wrong pin costs a lane.
+	up.WantCountry = map[string]string{}
 	for pref, cc := range cfg.ModelLanes {
 		up.WantCountry[pref] = cc
 	}

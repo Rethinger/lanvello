@@ -45,8 +45,13 @@ func TestFingerprintToolsChat(t *testing.T) {
 	if len(tools) != 4 {
 		t.Fatalf("want 4 tools, got %d", len(tools))
 	}
-	if tc, _ := body["tool_choice"].(string); tc != "none" {
-		t.Fatalf("tool_choice=%v", tc)
+	if tc, _ := body["tool_choice"].(string); tc != "auto" {
+		t.Fatalf("tool_choice=%v, a client that sent tools must stay able to call them", tc)
+	}
+	body2 := map[string]any{"tool_choice": "none"}
+	FingerprintTools(body2, false)
+	if tc, _ := body2["tool_choice"].(string); tc != "none" {
+		t.Fatalf("explicit tool_choice must survive: %v", tc)
 	}
 }
 

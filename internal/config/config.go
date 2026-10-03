@@ -18,6 +18,9 @@ type Config struct {
 	Fallback    []string          `json:"fallbackCountries"`
 	ModelLanes  map[string]string `json:"modelLanes"`
 	WaitBudgetS float64           `json:"waitBudgetS"`
+	// CatalogBudgetS bounds the lane wait for /v1/models, which must stay
+	// snappy even when every lane is busy with a long answer.
+	CatalogBudgetS float64 `json:"catalogBudgetS"`
 }
 
 func DefaultDataDir() string {
@@ -33,13 +36,14 @@ func DefaultDataDir() string {
 
 func Defaults() Config {
 	return Config{
-		Listen:      "127.0.0.1:11434",
-		Lanes:       5,
-		DataDir:     DefaultDataDir(),
-		BaseURL:     envOr("LANVELLO_BASE_URL", "https://opencode.ai"),
-		ClientVer:   envOr("LANVELLO_CLIENT_VERSION", "1.18.31"),
-		Countries:   []string{"us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"},
-		WaitBudgetS: 90,
+		Listen:         "127.0.0.1:11434",
+		Lanes:          5,
+		DataDir:        DefaultDataDir(),
+		BaseURL:        envOr("LANVELLO_BASE_URL", "https://opencode.ai"),
+		ClientVer:      envOr("LANVELLO_CLIENT_VERSION", "1.18.31"),
+		Countries:      []string{"us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"},
+		WaitBudgetS:    90,
+		CatalogBudgetS: 20,
 	}
 }
 
@@ -92,6 +96,9 @@ func LoadFile(path string, base Config) (Config, error) {
 	}
 	if f.WaitBudgetS > 0 {
 		base.WaitBudgetS = f.WaitBudgetS
+	}
+	if f.CatalogBudgetS > 0 {
+		base.CatalogBudgetS = f.CatalogBudgetS
 	}
 	if len(f.ModelLanes) > 0 {
 		if base.ModelLanes == nil {

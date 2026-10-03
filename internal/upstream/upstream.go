@@ -2,6 +2,9 @@
 // (https://opencode.ai/zen/v1) with the client fingerprint the free gate
 // requires: opencode user-agent, x-opencode-* headers, stream:true and the
 // bash/glob/grep/read tool quartet. No login, Bearer public.
+//
+// Every byte leaves through a lane. There is no code path that talks to the
+// free tier directly: a missing lane means an error, never a direct dial.
 package upstream
 
 import (
@@ -31,10 +34,10 @@ const (
 	PublicToken = "public"
 )
 
-// ResponsesModels live on /zen/v1/responses, MessagesModels on
-// /zen/v1/messages, everything else on /zen/v1/chat/completions.
-// Matching mirrors the cli: provider prefix and "model(level)" thinking
-// suffix are ignored, muse-spark matches by family regex.
+// MessagesModels live on /zen/v1/messages. union-alpha is the only id that
+// ever did, and the free tier does not serve it, so /v1/messages translates
+// to a chat-backed model instead of proxying. kept so a future tier that
+// does serve it routes correctly.
 var MessagesModels = map[string]bool{
 	"union-alpha": true,
 }
@@ -75,6 +78,8 @@ type Client struct {
 	SessionFor func(identity string) string
 	// WantCountry maps model prefix -> exit country (union-alpha -> us).
 	WantCountry map[string]string
+	// CatalogBudget bounds the lane wait for cheap calls like /v1/models.
+	CatalogBudget time.Duration
 }
 
 func (c *Client) countryFor(model string) string {
@@ -89,11 +94,15 @@ func (c *Client) countryFor(model string) string {
 
 func NewClient(m *lanes.Manager) *Client {
 	return &Client{
-		BaseURL:    ZenBase,
-		Lanes:      m,
-		HTTP:       &http.Client{Timeout: 180 * time.Second},
-		WaitBudget: 90 * time.Second,
-		SessionFor: func(identity string) string { return StableSession(identity) },
+		BaseURL: ZenBase,
+		Lanes:   m,
+		// No client-level timeout: a streamed answer lives for as long as the
+		// model thinks. Waiting for response headers is bounded, and a stalled
+		// body is caught per-read (see headerTimeout / streamIdle).
+		HTTP:          &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: headerTimeout}},
+		WaitBudget:    90 * time.Second,
+		CatalogBudget: 20 * time.Second,
+		SessionFor:    func(identity string) string { return StableSession(identity) },
 	}
 }
 
@@ -150,8 +159,9 @@ func (c *Client) clientFor(lane *lanes.Lane) *http.Client {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		},
+		ResponseHeaderTimeout: headerTimeout,
 	}
-	return &http.Client{Transport: transport, Timeout: 180 * time.Second}
+	return &http.Client{Transport: transport}
 }
 
 func endpointFor(model string) string {
@@ -199,8 +209,10 @@ func FingerprintTools(body map[string]any, flat bool) {
 		}
 	}
 	body["tools"] = list
-	if _, ok := body["tool_choice"]; !ok && !flat {
-		body["tool_choice"] = "none"
+	if _, ok := body["tool_choice"]; !ok {
+		// never "none": a client that sent tools without an explicit choice
+		// expects the model to be able to call them.
+		body["tool_choice"] = "auto"
 	}
 }
 
@@ -220,8 +232,7 @@ func toolName(t any) string {
 	return ""
 }
 
-// Do forwards one request with lane rotation. identity scopes the stable
-// session (use the caller api key). streamUp forces sse upstream.
+// Do forwards one non-streaming request with lane rotation.
 func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -237,10 +248,7 @@ func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Reque
 		return
 	}
 	flat := IsResponsesModel(model)
-	model = stripThinking(model)
-	if i := strings.Index(model, "/"); i >= 0 {
-		model = model[i+1:]
-	}
+	model = bareID(model)
 	body["model"] = model
 	body["stream"] = true
 	if flat {
@@ -249,10 +257,6 @@ func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Reque
 		if _, ok := body["input"]; !ok {
 			http.Error(w, "responses requires input", 400)
 			return
-		}
-		normalizeReasoning(body)
-		if _, ok := body["tool_choice"]; !ok {
-			body["tool_choice"] = "auto"
 		}
 	} else if !IsMessagesModel(model) {
 		if _, ok := body["messages"]; !ok {
@@ -271,21 +275,30 @@ func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Reque
 }
 
 // normalizeReasoning maps reasoning_effort onto reasoning{effort,summary}.
+// The responses endpoint speaks reasoning{}, chat/messages speak
+// reasoning_effort; effort must land on whichever the endpoint accepts.
 func normalizeReasoning(body map[string]any) {
 	cur, _ := body["reasoning"].(map[string]any)
 	eff, _ := body["reasoning_effort"].(string)
-	if cur == nil && eff == "" {
+	if eff == "" {
 		if e, ok := body["reasoning"].(string); ok {
 			eff = e
+			cur = nil
 		}
 	}
-	if eff == "" {
+	if eff == "" && cur == nil {
 		return
 	}
 	if cur == nil {
 		cur = map[string]any{}
 	}
-	cur["effort"] = strings.ToLower(strings.TrimSpace(eff))
+	if e, ok := cur["effort"].(string); ok && strings.TrimSpace(e) != "" {
+		eff = e
+	}
+	if eff != "" {
+		cur["effort"] = strings.ToLower(strings.TrimSpace(eff))
+	}
+	// the free tier expects an explicit summary mode alongside the effort
 	if _, ok := cur["summary"]; !ok {
 		cur["summary"] = "auto"
 	}
@@ -293,17 +306,222 @@ func normalizeReasoning(body map[string]any) {
 	delete(body, "reasoning_effort")
 }
 
+// normalizeEffortForPath applies the endpoint's own spelling of effort.
+func normalizeEffortForPath(path string, body map[string]any) {
+	if path == "/zen/v1/responses" {
+		normalizeReasoning(body)
+		return
+	}
+	eff, _ := body["reasoning_effort"].(string)
+	if eff == "" {
+		if r, ok := body["reasoning"].(map[string]any); ok {
+			eff, _ = r["effort"].(string)
+		}
+	}
+	delete(body, "reasoning")
+	if eff != "" {
+		body["reasoning_effort"] = eff
+	}
+}
+
 // Raw sends a prepared upstream body with lane rotation and returns the raw
-// upstream answer (sse bytes).
+// upstream answer (sse bytes). Used for stream:false aggregation.
 func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, http.Header, []byte) {
-	url := c.BaseURL + endpointFor(model)
+	var outH http.Header
+	var outB []byte
+	status, err := c.loop(model, identity, "POST", endpointFor(model), fwd, in,
+		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
+			outH = hdr
+			b, derr := drain(resp)
+			outB = b
+			return !retryable(st), derr
+		})
+	if err != nil {
+		return status, jsonHeader(), []byte(`{"error":` + quote(err.Error()) + `}`)
+	}
+	if outH == nil {
+		outH = jsonHeader()
+	}
+	return status, outH, outB
+}
+
+// GetJSON fetches a small upstream endpoint through a lane. The model
+// catalog must not leave the machine directly, so it uses the same rotation.
+func (c *Client) GetJSON(path string) (int, []byte) {
+	var out []byte
+	budget := c.CatalogBudget
+	if budget <= 0 {
+		budget = 20 * time.Second
+	}
+	status, _ := c.loopBudget("catalog", "catalog", "GET", path, nil, nil, budget,
+		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
+			b, derr := drain(resp)
+			out = b
+			return !retryable(st), derr
+		})
+	return status, out
+}
+
+// EventHandler consumes one upstream sse event and returns downstream lines.
+// payload is the raw data text ("[DONE]" sentinel included), ev is nil for
+// non-json payloads.
+type EventHandler func(payload string, ev map[string]any) (lines []string, done bool)
+
+// StreamEvents pipes the live upstream stream to fn, flushing each line as it
+// arrives. 429/5xx rotate to another lane until the first byte is committed.
+func (c *Client) StreamEvents(model, identity string, fwd []byte, in http.Header, w http.ResponseWriter, fn EventHandler) (int, error) {
+	return c.stream(model, identity, fwd, in, w, func(sink *streamSink, resp *http.Response) error {
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 256*1024), 8*1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" {
+				continue
+			}
+			if payload == "[DONE]" {
+				lines, _ := fn(payload, nil)
+				writeLines(sink, lines)
+				return nil
+			}
+			var ev map[string]any
+			if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+				continue
+			}
+			lines, done := fn(payload, ev)
+			writeLines(sink, lines)
+			if done {
+				return nil
+			}
+		}
+		return sc.Err()
+	})
+}
+
+func writeLines(sink *streamSink, lines []string) {
+	for _, l := range lines {
+		io.WriteString(sink, l+"\n\n")
+	}
+	sink.flush()
+}
+
+// StreamRaw relays upstream sse bytes verbatim, flushing as they arrive.
+func (c *Client) StreamRaw(model, identity string, fwd []byte, in http.Header, w http.ResponseWriter) (int, error) {
+	return c.stream(model, identity, fwd, in, w, func(sink *streamSink, resp *http.Response) error {
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := sink.Write(buf[:n]); werr != nil {
+					return werr
+				}
+			}
+			if rerr != nil {
+				if rerr == io.EOF {
+					return nil
+				}
+				return rerr
+			}
+		}
+	})
+}
+
+// headerTimeout bounds the wait for response headers. The free tier answers
+// with its first event long before the model finishes thinking.
+var headerTimeout = 3 * time.Minute
+
+// streamIdle is the per-read stall budget: a model that thinks for 10 minutes
+// between tokens must not be cut, a dead socket must not hang forever.
+var streamIdle = 10 * time.Minute
+
+// streamError is what the caller writes when nothing could be streamed.
+type StreamError struct {
+	Status int
+	Err    error
+}
+
+func (e *StreamError) Error() string { return e.Err.Error() }
+
+// stream hands the live upstream body to body, retrying retryable answers on
+// another lane before a single byte is written downstream.
+func (c *Client) stream(model, identity string, fwd []byte, in http.Header, w http.ResponseWriter, body func(sink *streamSink, resp *http.Response) error) (int, error) {
+	var sink *streamSink
+	status, err := c.loop(model, identity, "POST", endpointFor(model), fwd, in,
+		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
+			if retryable(st) {
+				_, _ = drain(resp)
+				return false, nil
+			}
+			if st != 200 {
+				b, _ := drain(resp)
+				relay(w, st, hdr, b)
+				return true, nil
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(200)
+			sink = &streamSink{w: w}
+			sink.flush()
+			return true, body(sink, resp)
+		})
+	if err != nil {
+		if se, ok := err.(*StreamError); ok {
+			return se.Status, se.Err
+		}
+		if status == 0 {
+			return http.StatusBadGateway, err
+		}
+	}
+	return status, err
+}
+
+// streamSink flushes every write so tokens reach the client as they arrive.
+type streamSink struct {
+	w  http.ResponseWriter
+	fl http.Flusher
+}
+
+func (s *streamSink) flush() {
+	if s.fl == nil {
+		s.fl, _ = s.w.(http.Flusher)
+	}
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+func (s *streamSink) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	s.flush()
+	return n, err
+}
+
+// consumer handles one upstream attempt: stop=true ends the rotation loop,
+// stop=false asks for another lane (body already drained).
+type consumer func(resp *http.Response, status int, hdr http.Header) (stop bool, err error)
+
+// loop picks a lane, sends one attempt and applies the rotation policy:
+// 429 parks the exit for retry-after, 5xx tries the next lane.
+func (c *Client) loop(model, identity, method, path string, fwd []byte, in http.Header, consume consumer) (int, error) {
+	return c.loopBudget(model, identity, method, path, fwd, in, c.WaitBudget, consume)
+}
+
+// loopBudget is loop with an explicit lane-wait budget, so cheap calls (the
+// model catalog) do not sit in the same queue as a 1M-token answer.
+func (c *Client) loopBudget(model, identity, method, path string, fwd []byte, in http.Header, budget time.Duration, consume consumer) (int, error) {
+	url := c.BaseURL + path
 	session := identity
 	if !ValidSession(session) {
 		session = c.SessionFor(identity)
 	}
 	var probe map[string]any
-	if err := json.Unmarshal(fwd, &probe); err == nil {
-		normalizeReasoning(probe)
+	if len(fwd) > 0 && json.Unmarshal(fwd, &probe) == nil {
+		normalizeEffortForPath(path, probe)
 		if b, err := json.Marshal(probe); err == nil {
 			fwd = b
 		}
@@ -311,57 +529,87 @@ func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, h
 	reqID := deriveRequestID(session, lastUserText(probe))
 
 	tried := map[int]bool{}
-	deadline := time.Now().Add(c.WaitBudget)
+	deadline := time.Now().Add(budget)
 	var lastErr string
 	wantCC := c.countryFor(model)
 	for {
 		lane := c.Lanes.PickCountry(tried, wantCC)
 		if lane == nil {
 			if time.Now().After(deadline) {
-				h := http.Header{}
-				h.Set("Content-Type", "application/json")
-				return 502, h, []byte(`{"error":"no lane available` + suffix(lastErr) + `"}`)
+				return 502, fmt.Errorf("no lane available: %s", lastErr)
 			}
 			time.Sleep(500 * time.Millisecond)
 			tried = map[int]bool{}
 			continue
 		}
 		tried[lane.Index] = true
-		status, hdr, respBody, rerr := c.roundTrip(lane, url, session, reqID, fwd, in)
+		resp, rerr := c.open(lane, method, url, session, reqID, fwd, in)
 		if rerr != nil {
 			lastErr = rerr.Error()
 			c.Lanes.Release(lane)
 			continue
 		}
+		st := resp.StatusCode
+		hdr := resp.Header
+		// The lane stays busy for the whole answer: it is held while the
+		// stream runs, not only while the request is in flight.
+		stop, cerr := consume(resp, st, hdr)
 		c.Lanes.Release(lane)
 		switch {
-		case status == 429:
+		case st == 429:
 			ra := parseRetryAfter(hdr.Get("Retry-After"))
 			until := c.Lanes.NoteLimited(lane, ra)
 			c.Lanes.Rotate(lane)
 			c.Lanes.Emit(lanes.Proof{T: time.Now(), Lane: lane.Index, Country: lane.Country, IP: lane.ExitIP, Model: model, Status: 429, Note: "exit limited until " + until.Format(time.RFC3339)})
+			if stop {
+				// the consumer already committed this answer downstream
+				return st, cerr
+			}
 			continue
-		case status == 502 || status == 503 || status == 504:
+		case st == 502 || st == 503 || st == 504:
+			if stop {
+				return st, cerr
+			}
 			continue
-		case status == 500:
+		case st == 500:
 			// Chat-path 500s are transient far-end failures; rotate once.
-			if len(tried) < len(c.Lanes.Lanes()) {
+			if !stop && len(tried) < len(c.Lanes.Lanes()) {
 				continue
 			}
-			return status, hdr, respBody
+			return st, cerr
 		default:
-			c.Lanes.NoteResult(lane.Country, status)
-			c.Lanes.Emit(lanes.Proof{T: time.Now(), Lane: lane.Index, Country: lane.Country, IP: lane.ExitIP, Model: model, Status: status, Bytes: int64(len(respBody))})
-			return status, hdr, respBody
+			// committed answer: score the exit and leave a proof row
+			c.Lanes.NoteResult(lane.Country, st)
+			c.Lanes.Emit(lanes.Proof{
+				T: time.Now(), Lane: lane.Index, Country: lane.Country, IP: lane.ExitIP,
+				Model: model, Status: st, Bytes: bodyBytes(resp),
+			})
+			return st, cerr
 		}
 	}
 }
 
-func (c *Client) roundTrip(lane *lanes.Lane, url, session, reqID string, body []byte, in http.Header) (int, http.Header, []byte, error) {
+func bodyBytes(resp *http.Response) int64 {
+	if resp == nil {
+		return 0
+	}
+	return resp.ContentLength
+}
+
+// open sends one attempt on a lane and returns the live response; the caller
+// owns resp.Body.
+func (c *Client) open(lane *lanes.Lane, method, url, session, reqID string, body []byte, in http.Header) (*http.Response, error) {
 	hc := c.clientFor(lane)
-	req, err := http.NewRequest("POST", url, bytesReader(body))
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytesReader(body)
+	}
+	req, err := http.NewRequest(method, url, rdr)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
+	}
+	if in == nil {
+		in = http.Header{}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -381,14 +629,61 @@ func (c *Client) roundTrip(lane *lanes.Lane, url, session, reqID string, body []
 	req.Header.Set("x-opencode-project", "global")
 	resp, err := hc.Do(req)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
 	}
+	// Guard against a silently dead upstream: no progress for streamIdle and
+	// the stream is considered broken.
+	resp.Body = &idleBody{rc: resp.Body, idle: streamIdle}
+	return resp, nil
+}
+
+// idleBody fails a read that makes no progress for d.
+type idleBody struct {
+	rc   io.ReadCloser
+	idle time.Duration
+	last time.Time
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	if b.last.IsZero() {
+		b.last = time.Now()
+	}
+	type res struct {
+		n   int
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		n, err := b.rc.Read(p)
+		ch <- res{n, err}
+	}()
+	select {
+	case r := <-ch:
+		b.last = time.Now()
+		return r.n, r.err
+	case <-time.After(b.idle):
+		b.rc.Close()
+		return 0, fmt.Errorf("upstream idle for %s", b.idle)
+	}
+}
+
+func (b *idleBody) Close() error { return b.rc.Close() }
+
+func drain(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, resp.Header, nil, err
+		return nil, err
 	}
-	return resp.StatusCode, resp.Header, b, nil
+	return b, nil
+}
+
+func retryable(status int) bool {
+	switch status {
+	case 429, 500, 502, 503, 504:
+		return true
+	}
+	return false
 }
 
 func validOpencodeUA(ua string) bool {
@@ -406,11 +701,27 @@ func validOpencodeUA(ua string) bool {
 	return major > 1 || (major == 1 && minor >= 17)
 }
 
+func jsonHeader() http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	return h
+}
+
+func quote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func relay(w http.ResponseWriter, status int, hdr http.Header, body []byte) {
 	for _, k := range []string{"Content-Type", "Retry-After"} {
 		if v := hdr.Get(k); v != "" {
-			w.Header().Set(k, v)
+			if w != nil {
+				w.Header().Set(k, v)
+			}
 		}
+	}
+	if w == nil {
+		return
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
@@ -455,6 +766,9 @@ func deriveRequestID(session, text string) string {
 
 // lastUserText extracts the trailing user text from chat or responses bodies.
 func lastUserText(body map[string]any) string {
+	if body == nil {
+		return ""
+	}
 	if arr, ok := body["messages"].([]any); ok {
 		for i := len(arr) - 1; i >= 0; i-- {
 			mm, ok := arr[i].(map[string]any)
@@ -462,11 +776,7 @@ func lastUserText(body map[string]any) string {
 				continue
 			}
 			if s, ok := mm["content"].(string); ok && strings.TrimSpace(s) != "" {
-				t := strings.TrimSpace(s)
-				if len(t) > 600 {
-					t = t[len(t)-600:]
-				}
-				return t
+				return tail(s)
 			}
 		}
 		return ""
@@ -492,15 +802,20 @@ func lastUserText(body map[string]any) string {
 					}
 				}
 				if t := strings.TrimSpace(sb.String()); t != "" {
-					if len(t) > 600 {
-						t = t[len(t)-600:]
-					}
-					return t
+					return tail(t)
 				}
 			}
 		}
 	}
 	return ""
+}
+
+func tail(s string) string {
+	t := strings.TrimSpace(s)
+	if len(t) > 600 {
+		t = t[len(t)-600:]
+	}
+	return t
 }
 
 // sanitizeResponsesInput normalizes native responses input the way the
@@ -599,13 +914,6 @@ func validJSON(s string) bool {
 	return json.Unmarshal([]byte(s), &v) == nil
 }
 
-func suffix(s string) string {
-	if s == "" {
-		return ""
-	}
-	return ": " + s
-}
-
 func bodyModel(body []byte) string {
 	var v struct {
 		Model string `json:"model"`
@@ -616,14 +924,20 @@ func bodyModel(body []byte) string {
 	return v.Model
 }
 
-type readerFunc struct{}
-
-func bytesReader(b []byte) io.Reader { return &byteReader{b: b} }
+func bareID(m string) string {
+	m = stripThinking(m)
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	return m
+}
 
 type byteReader struct {
 	b []byte
 	i int
 }
+
+func bytesReader(b []byte) io.Reader { return &byteReader{b: b} }
 
 func (r *byteReader) Read(p []byte) (int, error) {
 	if r.i >= len(r.b) {
