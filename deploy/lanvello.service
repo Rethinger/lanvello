@@ -1,0 +1,15 @@
+[Unit]
+Description=lanvello universal gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/lanvello serve --listen 127.0.0.1:11434 --lanes 5
+Environment=LANVELLO_DATA_DIR=/var/lib/lanvello
+# Environment=LANVELLO_GATEWAY_TOKEN=...
+# Environment=LANVELLO_UPSTREAMS_JSON=[...]
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
