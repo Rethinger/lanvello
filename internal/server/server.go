@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"lanvello/internal/keys"
 	"lanvello/internal/lanes"
@@ -37,6 +38,11 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) identity(r *http.Request) string {
+	// Chain a downstream opencode session when it is already valid so
+	// quota accounting stays on one conversation.
+	if ses := strings.TrimSpace(r.Header.Get("x-opencode-session")); upstream.ValidSession(ses) {
+		return ses
+	}
 	sec := keys.BearerOf(r.Header.Get("Authorization"))
 	if sec == "" {
 		sec = r.URL.Query().Get("api_key")
@@ -67,7 +73,6 @@ var freeModels = []string{
 	"opencode/muse-spark-1.3-contributor-free",
 	"opencode/muse-spark-1.2-contributor-free",
 	"opencode/union-alpha",
-	"opencode/jev-1.13-free",
 	"opencode/longcat-2.5-preview-free",
 	"opencode/space-bunny-free",
 	"opencode/fledge-alpha-free",
@@ -78,6 +83,43 @@ var freeModels = []string{
 	"opencode/nemotron-3-ultra-free",
 	"opencode/nemotron-3.5-lightning-free",
 	"opencode/big-pickle",
+}
+
+// liveModels asks upstream for the current catalog and keeps free ids.
+func (s *Server) liveModels() []string {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", s.Up.BaseURL+"/zen/v1/models", nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", "opencode/1.18.31")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var v struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return nil
+	}
+	var out []string
+	for _, m := range v.Data {
+		id := m.ID
+		if id == "jev-1.13-free" {
+			continue // systemone api, not served yet
+		}
+		if strings.HasSuffix(id, "-free") || id == "big-pickle" || id == "union-alpha" {
+			out = append(out, "opencode/"+id)
+		}
+	}
+	return out
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
@@ -94,8 +136,12 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		Object  string `json:"object"`
 		OwnedBy string `json:"owned_by"`
 	}
+	ids := s.liveModels()
+	if len(ids) == 0 {
+		ids = freeModels
+	}
 	var mods []ent
-	for _, id := range freeModels {
+	for _, id := range ids {
 		mods = append(mods, ent{ID: id, Object: "model", OwnedBy: "opencode"})
 	}
 	w.Header().Set("Content-Type", "application/json")

@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -32,17 +33,31 @@ const (
 
 // ResponsesModels live on /zen/v1/responses, MessagesModels on
 // /zen/v1/messages, everything else on /zen/v1/chat/completions.
-var ResponsesModels = map[string]bool{
-	"muse-spark-1.2-contributor-free": true,
-	"muse-spark-1.3-contributor-free": true,
-}
-
+// Matching mirrors the cli: provider prefix and "model(level)" thinking
+// suffix are ignored, muse-spark matches by family regex.
 var MessagesModels = map[string]bool{
 	"union-alpha": true,
 }
 
-func IsResponsesModel(m string) bool { return ResponsesModels[stripThinking(m)] }
-func IsMessagesModel(m string) bool  { return MessagesModels[stripThinking(m)] }
+func baseID(m string) string {
+	m = stripThinking(m)
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	return m
+}
+
+func IsResponsesModel(m string) bool {
+	b := strings.ToLower(baseID(m))
+	if strings.HasPrefix(b, "muse-spark") || strings.HasPrefix(b, "muse_spark") {
+		return true
+	}
+	return ResponsesModelsExact[b]
+}
+
+var ResponsesModelsExact = map[string]bool{}
+
+func IsMessagesModel(m string) bool { return MessagesModels[strings.ToLower(baseID(m))] }
 
 func stripThinking(m string) string {
 	// "model(level)" -> "model"
@@ -58,7 +73,6 @@ type Client struct {
 	HTTP       *http.Client
 	WaitBudget time.Duration
 	SessionFor func(identity string) string
-	RequestID  func() string
 }
 
 func NewClient(m *lanes.Manager) *Client {
@@ -68,7 +82,6 @@ func NewClient(m *lanes.Manager) *Client {
 		HTTP:       &http.Client{Timeout: 180 * time.Second},
 		WaitBudget: 90 * time.Second,
 		SessionFor: func(identity string) string { return StableSession(identity) },
-		RequestID:  func() string { return NewRequestID() },
 	}
 }
 
@@ -212,13 +225,22 @@ func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Reque
 		return
 	}
 	flat := IsResponsesModel(model)
-	body["model"] = stripThinking(model)
+	model = stripThinking(model)
+	if i := strings.Index(model, "/"); i >= 0 {
+		model = model[i+1:]
+	}
+	body["model"] = model
 	body["stream"] = true
 	if flat {
 		body["store"] = false
+		sanitizeResponsesInput(body)
 		if _, ok := body["input"]; !ok {
 			http.Error(w, "responses requires input", 400)
 			return
+		}
+		normalizeReasoning(body)
+		if _, ok := body["tool_choice"]; !ok {
+			body["tool_choice"] = "auto"
 		}
 	} else if !IsMessagesModel(model) {
 		if _, ok := body["messages"]; !ok {
@@ -236,12 +258,45 @@ func (c *Client) Do(model, identity string, w http.ResponseWriter, r *http.Reque
 	relay(w, status, hdr, respBody)
 }
 
+// normalizeReasoning maps reasoning_effort onto reasoning{effort,summary}.
+func normalizeReasoning(body map[string]any) {
+	cur, _ := body["reasoning"].(map[string]any)
+	eff, _ := body["reasoning_effort"].(string)
+	if cur == nil && eff == "" {
+		if e, ok := body["reasoning"].(string); ok {
+			eff = e
+		}
+	}
+	if eff == "" {
+		return
+	}
+	if cur == nil {
+		cur = map[string]any{}
+	}
+	cur["effort"] = strings.ToLower(strings.TrimSpace(eff))
+	if _, ok := cur["summary"]; !ok {
+		cur["summary"] = "auto"
+	}
+	body["reasoning"] = cur
+	delete(body, "reasoning_effort")
+}
+
 // Raw sends a prepared upstream body with lane rotation and returns the raw
-// upstream answer (sse bytes). It calls w only on total lane failure.
+// upstream answer (sse bytes).
 func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, http.Header, []byte) {
 	url := c.BaseURL + endpointFor(model)
-	session := c.SessionFor(identity)
-	reqID := c.RequestID()
+	session := identity
+	if !ValidSession(session) {
+		session = c.SessionFor(identity)
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(fwd, &probe); err == nil {
+		normalizeReasoning(probe)
+		if b, err := json.Marshal(probe); err == nil {
+			fwd = b
+		}
+	}
+	reqID := deriveRequestID(session, lastUserText(probe))
 
 	tried := map[int]bool{}
 	deadline := time.Now().Add(c.WaitBudget)
@@ -364,6 +419,171 @@ func parseRetryAfter(v string) time.Duration {
 		return d
 	}
 	return 0
+}
+
+var sesRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+var msgRe = regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+func ValidSession(s string) bool { return sesRe.MatchString(s) }
+
+// deriveRequestID is stable per (session, last user text) so retries share
+// the id instead of burning quota as fresh requests.
+func deriveRequestID(session, text string) string {
+	if text == "" {
+		return NewRequestID()
+	}
+	sum := sha256.Sum256([]byte("opencode-req\x00" + session + "\x00" + text))
+	id := "msg_" + hex.EncodeToString(sum[:6]) + b62map(sum[6:20])
+	if !msgRe.MatchString(id) {
+		return NewRequestID()
+	}
+	return id
+}
+
+// lastUserText extracts the trailing user text from chat or responses bodies.
+func lastUserText(body map[string]any) string {
+	if arr, ok := body["messages"].([]any); ok {
+		for i := len(arr) - 1; i >= 0; i-- {
+			mm, ok := arr[i].(map[string]any)
+			if !ok || mm["role"] != "user" {
+				continue
+			}
+			if s, ok := mm["content"].(string); ok && strings.TrimSpace(s) != "" {
+				t := strings.TrimSpace(s)
+				if len(t) > 600 {
+					t = t[len(t)-600:]
+				}
+				return t
+			}
+		}
+		return ""
+	}
+	if s, ok := body["input"].(string); ok {
+		return s
+	}
+	if arr, ok := body["input"].([]any); ok {
+		for i := len(arr) - 1; i >= 0; i-- {
+			mm, ok := arr[i].(map[string]any)
+			if !ok || mm["role"] != "user" {
+				continue
+			}
+			if parts, ok := mm["content"].([]any); ok {
+				var sb strings.Builder
+				for _, p := range parts {
+					pm, ok := p.(map[string]any)
+					if !ok {
+						continue
+					}
+					if t, ok := pm["text"].(string); ok {
+						sb.WriteString(t + " ")
+					}
+				}
+				if t := strings.TrimSpace(sb.String()); t != "" {
+					if len(t) > 600 {
+						t = t[len(t)-600:]
+					}
+					return t
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// sanitizeResponsesInput normalizes native responses input the way the
+// official client does: string -> message array, empty -> placeholder,
+// reasoning items and encrypted blobs dropped (re-sending another
+// caller/account encrypted_content 400s), call ids clamped.
+func sanitizeResponsesInput(body map[string]any) {
+	if s, ok := body["input"].(string); ok {
+		if strings.TrimSpace(s) == "" {
+			s = "..."
+		}
+		body["input"] = []any{map[string]any{
+			"type": "message", "role": "user",
+			"content": []any{map[string]any{"type": "input_text", "text": s}},
+		}}
+		return
+	}
+	arr, ok := body["input"].([]any)
+	if !ok {
+		return
+	}
+	if len(arr) == 0 {
+		body["input"] = []any{map[string]any{
+			"type": "message", "role": "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "..."}},
+		}}
+		return
+	}
+	kept := arr[:0]
+	for _, it := range arr {
+		mm, ok := it.(map[string]any)
+		if !ok {
+			kept = append(kept, it)
+			continue
+		}
+		if mm["type"] == "reasoning" {
+			continue
+		}
+		delete(mm, "encrypted_content")
+		delete(mm, "reasoning_encrypted_content")
+		if mm["type"] == "function_call" {
+			if id, ok := mm["call_id"].(string); ok {
+				mm["call_id"] = clampCallID(id)
+			}
+			if a := mm["arguments"]; a != nil {
+				if s, ok := a.(string); !ok || !validJSON(s) {
+					if s, ok := a.(string); ok && s == "" {
+						mm["arguments"] = "{}"
+					} else if !ok {
+						if b, err := json.Marshal(a); err == nil {
+							mm["arguments"] = string(b)
+						} else {
+							mm["arguments"] = "{}"
+						}
+					} else {
+						mm["arguments"] = "{}"
+					}
+				}
+			}
+		}
+		if mm["type"] == "function_call_output" {
+			if id, ok := mm["call_id"].(string); ok {
+				mm["call_id"] = clampCallID(id)
+			}
+			switch o := mm["output"].(type) {
+			case string:
+			case nil:
+				mm["output"] = ""
+			default:
+				if b, err := json.Marshal(o); err == nil {
+					mm["output"] = string(b)
+				} else {
+					mm["output"] = ""
+				}
+			}
+		}
+		kept = append(kept, mm)
+	}
+	body["input"] = kept
+}
+
+func clampCallID(id string) string {
+	if id == "" {
+		var b [8]byte
+		_, _ = rand.Read(b[:])
+		return "call_" + hex.EncodeToString(b[:])
+	}
+	if len(id) > 64 {
+		return id[:64]
+	}
+	return id
+}
+
+func validJSON(s string) bool {
+	var v any
+	return json.Unmarshal([]byte(s), &v) == nil
 }
 
 func suffix(s string) string {
