@@ -156,7 +156,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if !wantStream {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		_, _ = w.Write(translate.AggregateResponses(body, "opencode/"+model))
+		_, _ = w.Write(translate.AggregateResponsesConv(body, "opencode/"+model))
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -164,6 +164,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(200)
 	fl, _ := w.(http.Flusher)
+	conv := &translate.StreamConv{}
 	sc := bufio.NewScanner(bytes.NewReader(body))
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -179,7 +180,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 			continue
 		}
-		lines, done := translate.ResponsesSSEToOpenAI(ev, "opencode/"+model)
+		lines, done := conv.Feed(ev, "opencode/"+model)
 		for _, l := range lines {
 			io.WriteString(w, l+"\n\n")
 			if fl != nil {
