@@ -46,7 +46,7 @@ func main() {
 func usage() {
 	fmt.Println(`lanvello - opencode free models over one local openai-compatible port
 usage:
-  lanvello serve [--listen 127.0.0.1:11434] [--lanes 5] [--no-tor] [--config file.json]
+  lanvello serve [--listen 127.0.0.1:11434] [--lanes 5] [--config file.json]
   lanvello key add --name aider
   lanvello key list
   lanvello key revoke --name aider
@@ -59,7 +59,6 @@ func baseConfig(args []string) config.Config {
 	fs := flag.NewFlagSet("base", flag.ContinueOnError)
 	listen := fs.String("listen", "", "listen addr")
 	ln := fs.Int("lanes", 0, "lane count")
-	noTor := fs.Bool("no-tor", false, "skip tor")
 	cfgPath := fs.String("config", "", "config json path")
 	dataDir := fs.String("data-dir", "", "state dir")
 	_ = fs.Parse(args)
@@ -72,12 +71,6 @@ func baseConfig(args []string) config.Config {
 	}
 	if *ln > 0 {
 		cfg.Lanes = *ln
-	}
-	if *noTor {
-		cfg.NoTor = true
-	}
-	if os.Getenv("LANVELLO_NO_TOR") == "1" {
-		cfg.NoTor = true
 	}
 	if *dataDir != "" {
 		cfg.DataDir = *dataDir
@@ -102,15 +95,30 @@ func openDeps(cfg config.Config) (*keys.Store, *lanes.Manager) {
 		os.Exit(1)
 	}
 	pri, fb := lanes.LoadCountriesFile(cfg.DataDir, cfg.Countries, cfg.Fallback)
-	m := lanes.New(cfg.DataDir, pri, fb, cfg.Socks, cfg.NoTor, cfg.Lanes)
+	m := lanes.New(cfg.DataDir, pri, fb, cfg.Socks, false, cfg.Lanes)
 	return ks, m
+}
+
+func healthySocks(m *lanes.Manager) int {
+	n := 0
+	for _, l := range m.Lanes() {
+		if l.Healthy && l.SocksAddr != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func cmdServe(args []string) {
 	cfg := baseConfig(args)
 	ks, m := openDeps(cfg)
-	if !cfg.NoTor && len(cfg.Socks) == 0 {
-		tor.Ensure(m, cfg.DataDir, 52001, 52301, 60*time.Second)
+	// tor-only: direct egress is gone. without tor lanes there is no service.
+	if len(cfg.Socks) == 0 {
+		tor.Ensure(m, cfg.DataDir, 52001, 52301, 90*time.Second)
+	}
+	if n := healthySocks(m); n == 0 {
+		fmt.Fprintln(os.Stderr, "no tor lanes up (tor binary missing or bootstrap failed) -- refusing to serve direct")
+		os.Exit(1)
 	}
 	up := upstream.NewClient(m)
 	up.BaseURL = cfg.BaseURL
@@ -120,7 +128,7 @@ func cmdServe(args []string) {
 		up.WantCountry[pref] = cc
 	}
 	srv := server.New(ks, m, up)
-	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor=%v free-only, no login\n", version, cfg.Listen, cfg.Lanes, !cfg.NoTor)
+	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor-only, free, no login\n", version, cfg.Listen, cfg.Lanes)
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

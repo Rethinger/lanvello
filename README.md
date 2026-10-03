@@ -52,12 +52,10 @@ proof goes to `$dataDir/proof.jsonl`.
 
 first run with tor enabled downloads the linux expert bundle (~30mb,
 once) into `$dataDir/tools` when no system tor exists — same idea as
-lingling, no root needed. then one tor process per lane:
-
-- explicit socks list in config `socks: ["127.0.0.1:9050"]`, or
-- local tor processes per lane (`tor` binary + generated torrc with
-  `ExitNodes {cc}`), or
-- `--no-tor` / `LANVELLO_NO_TOR=1` for direct egress.
+lingling, no root needed. then one tor process per lane, pinned with
+`ExitNodes {cc}`. there is no direct mode: without at least one healthy
+tor lane the server refuses to start. an explicit socks list in config
+(`socks: ["127.0.0.1:9050"]`) can replace spawned processes.
 
 `countries.txt` in the data dir overrides pools like lingling:
 line 1 primary, line 2 fallback, two-letter codes, `#` comments.

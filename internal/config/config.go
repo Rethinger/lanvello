@@ -10,7 +10,6 @@ import (
 type Config struct {
 	Listen      string            `json:"listen"`
 	Lanes       int               `json:"lanes"`
-	NoTor       bool              `json:"noTor"`
 	DataDir     string            `json:"dataDir"`
 	BaseURL     string            `json:"baseURL"`
 	ClientVer   string            `json:"clientVersion"`
@@ -101,9 +100,6 @@ func LoadFile(path string, base Config) (Config, error) {
 		for k, v := range f.ModelLanes {
 			base.ModelLanes[k] = v
 		}
-	}
-	if f.NoTor {
-		base.NoTor = true
 	}
 	return base, nil
 }
