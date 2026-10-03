@@ -73,6 +73,18 @@ type Client struct {
 	HTTP       *http.Client
 	WaitBudget time.Duration
 	SessionFor func(identity string) string
+	// WantCountry maps model prefix -> exit country (union-alpha -> us).
+	WantCountry map[string]string
+}
+
+func (c *Client) countryFor(model string) string {
+	best, cc := "", ""
+	for pref, country := range c.WantCountry {
+		if pref != "" && strings.HasPrefix(model, pref) && len(pref) > len(best) {
+			best, cc = pref, country
+		}
+	}
+	return cc
 }
 
 func NewClient(m *lanes.Manager) *Client {
@@ -301,8 +313,9 @@ func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, h
 	tried := map[int]bool{}
 	deadline := time.Now().Add(c.WaitBudget)
 	var lastErr string
+	wantCC := c.countryFor(model)
 	for {
-		lane := c.Lanes.Pick(tried)
+		lane := c.Lanes.PickCountry(tried, wantCC)
 		if lane == nil {
 			if time.Now().After(deadline) {
 				h := http.Header{}

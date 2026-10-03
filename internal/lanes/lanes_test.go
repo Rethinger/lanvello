@@ -20,6 +20,20 @@ func TestPickLeastLoaded(t *testing.T) {
 	m.Release(b)
 }
 
+func TestPickCountry(t *testing.T) {
+	m := lanes.New(t.TempDir(), []string{"us", "de"}, nil, []string{"127.0.0.1:1111", "127.0.0.1:2222"}, true, 2)
+	got := m.PickCountry(nil, "de")
+	if got == nil || got.Country != "de" {
+		t.Fatalf("want de lane, got %+v", got)
+	}
+	m.Release(got)
+	got = m.PickCountry(nil, "fr")
+	if got == nil {
+		t.Fatal("fallback failed")
+	}
+	m.Release(got)
+}
+
 func TestLimitedLanesDeprioritized(t *testing.T) {
 	m := lanes.New(t.TempDir(), []string{"de", "nl"}, nil, []string{"127.0.0.1:1111", "127.0.0.1:2222"}, true, 2)
 	ls := m.Lanes()

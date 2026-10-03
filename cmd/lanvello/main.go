@@ -115,6 +115,10 @@ func cmdServe(args []string) {
 	up := upstream.NewClient(m)
 	up.BaseURL = cfg.BaseURL
 	up.WaitBudget = time.Duration(cfg.WaitBudgetS * float64(time.Second))
+	up.WantCountry = map[string]string{"union-alpha": "us"}
+	for pref, cc := range cfg.ModelLanes {
+		up.WantCountry[pref] = cc
+	}
 	srv := server.New(ks, m, up)
 	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor=%v free-only, no login\n", version, cfg.Listen, cfg.Lanes, !cfg.NoTor)
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {

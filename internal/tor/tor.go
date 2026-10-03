@@ -3,15 +3,171 @@
 package tor
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"time"
+
+	"golang.org/x/net/proxy"
 
 	"lanvello/internal/lanes"
 )
+
+const torDistURL = "https://archive.torproject.org/tor-package-archive/torbrowser/"
+
+var torVerRe = regexp.MustCompile(`href="(\d+\.\d+\.\d+)/"`)
+
+// EnsureTools downloads the linux tor expert bundle once when no tor binary
+// exists. Returns the binary path or "".
+func EnsureTools(dataDir string) string {
+	if bin := FindTor(); bin != "" {
+		return bin
+	}
+	tools := filepath.Join(dataDir, "tools")
+	if bin := findBundleTor(tools); bin != "" {
+		return bin
+	}
+	ver, err := latestTorVersion()
+	if err != nil {
+		return ""
+	}
+	name := "tor-expert-bundle-linux-x86_64-" + ver + ".tar.gz"
+	tmp := filepath.Join(tools, name)
+	if err := os.MkdirAll(tools, 0o700); err != nil {
+		return ""
+	}
+	if err := downloadFile(torDistURL+ver+"/"+name, tmp); err != nil {
+		return ""
+	}
+	defer os.Remove(tmp)
+	if err := extractTarGz(tmp, tools); err != nil {
+		return ""
+	}
+	bin := findBundleTor(tools)
+	if bin != "" {
+		_ = os.Chmod(bin, 0o755)
+	}
+	return bin
+}
+
+func findBundleTor(tools string) string {
+	for _, c := range []string{filepath.Join(tools, "tor", "tor")} {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func latestTorVersion() (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(torDistURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	var best string
+	var bestT [3]int
+	for _, m := range torVerRe.FindAllSubmatch(b, -1) {
+		var t [3]int
+		fmt.Sscanf(string(m[1]), "%d.%d.%d", &t[0], &t[1], &t[2])
+		greater := false
+		if best == "" {
+			greater = true
+		} else {
+			for i := 0; i < 3; i++ {
+				if t[i] != bestT[i] {
+					greater = t[i] > bestT[i]
+					break
+				}
+			}
+		}
+		if greater {
+			best, bestT = string(m[1]), t
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf("no tor version found")
+	}
+	return best, nil
+}
+
+func downloadFile(url, dst string) error {
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+func extractTarGz(src, dst string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	root, _ := filepath.Abs(dst)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target, _ := filepath.Abs(filepath.Join(dst, h.Name))
+		if target != root && !filepath.HasPrefix(target, root+string(os.PathSeparator)) {
+			return fmt.Errorf("unsafe path: %s", h.Name)
+		}
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(h.Mode))
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(out, tr)
+			out.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
 
 func BinaryName() string { return "tor" }
 
@@ -30,7 +186,28 @@ func FindTor() string {
 	return ""
 }
 
-func writeTorrc(dir string, socksPort, ctrlPort int, country string) error {
+// ToolsDir is <dataDir>/tools holding the expert bundle (tor/tor, data/geoip).
+func geoipFor(bin string) (string, string) {
+	try := []string{
+		filepath.Join(filepath.Dir(filepath.Dir(bin)), "data", "geoip"),
+		filepath.Join(filepath.Dir(bin), "geoip"),
+	}
+	var g, g6 string
+	for _, p := range try {
+		if _, err := os.Stat(p); err == nil {
+			g = p
+			break
+		}
+	}
+	if g != "" {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(g), "geoip6")); err == nil {
+			g6 = filepath.Join(filepath.Dir(g), "geoip6")
+		}
+	}
+	return g, g6
+}
+
+func writeTorrc(bin, dir string, socksPort, ctrlPort int, country string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -48,6 +225,12 @@ func writeTorrc(dir string, socksPort, ctrlPort int, country string) error {
 		"CircuitStreamTimeout 20\n" +
 		"RunAsDaemon 0\n" +
 		fmt.Sprintf("ExitNodes %s\nStrictNodes 1\n", exit)
+	if g, g6 := geoipFor(bin); g != "" {
+		cfg += fmt.Sprintf("GeoIPFile %s\n", g)
+		if g6 != "" {
+			cfg += fmt.Sprintf("GeoIPv6File %s\n", g6)
+		}
+	}
 	return os.WriteFile(filepath.Join(dir, "torrc"), []byte(cfg), 0o600)
 }
 
@@ -64,13 +247,41 @@ func waitPort(addr string, timeout time.Duration) bool {
 	return false
 }
 
+// exitIP resolves the lane's public ip through its own socks port.
+func exitIP(socks string) string {
+	d, err := proxy.SOCKS5("tcp", socks, nil, proxy.Direct)
+	if err != nil {
+		return ""
+	}
+	tr := &http.Transport{Dial: func(n, a string) (net.Conn, error) { return d.Dial(n, a) }}
+	hc := &http.Client{Transport: tr, Timeout: 20 * time.Second}
+	resp, err := hc.Get("https://api.ipify.org")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // Ensure starts one tor per lane when no explicit socks are given.
-// It mutates lane SocksAddr/ExitIP best-effort; missing tor binary is not fatal.
+// It auto-downloads the expert bundle once if no tor binary exists.
+// Missing tor binary is not fatal (lanes stay direct/unhealthy).
 func Ensure(m *lanes.Manager, dataDir string, base, ctrlBase int, timeout time.Duration) {
 	bin := FindTor()
 	if bin == "" {
+		bin = EnsureTools(dataDir)
+	}
+	if bin == "" {
 		return
 	}
+	_ = os.Setenv("LANVELLO_TOR_EXE", bin)
+	libPath := filepath.Join(filepath.Dir(bin))
+	env := os.Environ()
+	env = append(env, "LD_LIBRARY_PATH="+libPath)
 	for _, l := range m.Lanes() {
 		if l.SocksAddr != "" {
 			continue
@@ -78,8 +289,9 @@ func Ensure(m *lanes.Manager, dataDir string, base, ctrlBase int, timeout time.D
 		socks := base + l.Index - 1
 		ctrl := ctrlBase + l.Index - 1
 		dir := filepath.Join(dataDir, "lanes", fmt.Sprintf("tor-%d", l.Index))
-		_ = writeTorrc(dir, socks, ctrl, l.Country)
+		_ = writeTorrc(bin, dir, socks, ctrl, l.Country)
 		cmd := exec.Command(bin, "-f", filepath.Join(dir, "torrc"))
+		cmd.Env = env
 		cmd.Stdout = nil
 		cmd.Stderr = nil
 		if err := cmd.Start(); err != nil {
@@ -89,6 +301,7 @@ func Ensure(m *lanes.Manager, dataDir string, base, ctrlBase int, timeout time.D
 		if waitPort(addr, timeout) {
 			l.SocksAddr = addr
 			l.Healthy = true
+			l.ExitIP = exitIP(addr)
 		}
 	}
 }

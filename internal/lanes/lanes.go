@@ -154,6 +154,21 @@ func lower(s string) string {
 
 // Pick returns the least-loaded healthy lane not in exclude.
 func (m *Manager) Pick(exclude map[int]bool) *Lane {
+	return m.PickCountry(exclude, "")
+}
+
+// PickCountry prefers lanes pinned to cc (per-model exit country, e.g.
+// union-alpha wants us); falls back to any healthy lane.
+func (m *Manager) PickCountry(exclude map[int]bool, cc string) *Lane {
+	if cc != "" {
+		if l := m.pick(exclude, cc); l != nil {
+			return l
+		}
+	}
+	return m.pick(exclude, "")
+}
+
+func (m *Manager) pick(exclude map[int]bool, cc string) *Lane {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
@@ -163,6 +178,9 @@ func (m *Manager) Pick(exclude map[int]bool) *Lane {
 			continue
 		}
 		if !l.Healthy || l.Healing {
+			continue
+		}
+		if cc != "" && l.Country != cc {
 			continue
 		}
 		if best == nil {

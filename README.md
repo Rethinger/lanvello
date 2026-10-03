@@ -50,6 +50,10 @@ proof goes to `$dataDir/proof.jsonl`.
 
 ## tor lanes
 
+first run with tor enabled downloads the linux expert bundle (~30mb,
+once) into `$dataDir/tools` when no system tor exists — same idea as
+lingling, no root needed. then one tor process per lane:
+
 - explicit socks list in config `socks: ["127.0.0.1:9050"]`, or
 - local tor processes per lane (`tor` binary + generated torrc with
   `ExitNodes {cc}`), or
@@ -57,6 +61,11 @@ proof goes to `$dataDir/proof.jsonl`.
 
 `countries.txt` in the data dir overrides pools like lingling:
 line 1 primary, line 2 fallback, two-letter codes, `#` comments.
+
+per-model exits: `modelLanes: {"union-alpha": "us"}` in config pins a
+model family to an exit country (union-alpha only serves us exits);
+requests for other models use the least-loaded lane. 429 handling is
+per exit ip with `retry-after` respected, exactly the free-tier bypass.
 
 ## deploy
 
