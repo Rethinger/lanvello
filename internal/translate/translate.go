@@ -378,4 +378,60 @@ func AggregateResponses(sse []byte, model string) []byte {
 	return b
 }
 
+// AggregateOpenAI collects openai sse chunks into one chat completion.
+func AggregateOpenAI(sse []byte, model string) []byte {
+	var sb strings.Builder
+	var tools []any
+	finish := "stop"
+	sc := bufio.NewScanner(bytes.NewReader(sse))
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			break
+		}
+		var ch map[string]any
+		if err := json.Unmarshal([]byte(payload), &ch); err != nil {
+			continue
+		}
+		choices, _ := ch["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		c0, _ := choices[0].(map[string]any)
+		if fr, ok := c0["finish_reason"].(string); ok && fr != "" && fr != "null" {
+			finish = fr
+		}
+		delta, _ := c0["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if s, ok := delta["content"].(string); ok {
+			sb.WriteString(s)
+		}
+		if tc, ok := delta["tool_calls"].([]any); ok {
+			tools = append(tools, tc...)
+		}
+	}
+	msg := map[string]any{"role": "assistant", "content": sb.String()}
+	if len(tools) > 0 {
+		msg["tool_calls"] = tools
+		finish = "tool_calls"
+	}
+	resp := map[string]any{
+		"id": "chatcmpl-lanvello", "object": "chat.completion",
+		"created": 0, "model": model,
+		"choices": []any{map[string]any{
+			"index": 0, "message": msg, "finish_reason": finish,
+		}},
+		"usage": map[string]any{},
+	}
+	b, _ := json.Marshal(resp)
+	return b
+}
+
 var _ = fmt.Sprint

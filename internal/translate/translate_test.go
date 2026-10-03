@@ -57,6 +57,24 @@ func TestAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregateOpenAI(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"he\"},\"finish_reason\":\"\"}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"\"}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n"
+	b := translate.AggregateOpenAI([]byte(sse), "m")
+	var v struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Choices[0].Message.Content != "hello" {
+		t.Fatalf("got %q", v.Choices[0].Message.Content)
+	}
+}
+
 func TestSSEChunk(t *testing.T) {
 	lines, done := translate.ResponsesSSEToOpenAI(
 		map[string]any{"type": "response.output_text.delta", "delta": "x"}, "m")

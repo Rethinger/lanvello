@@ -187,7 +187,27 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// native chat/messages path: forward as-is with fingerprint.
 		nr, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(raw))
 		nr.Header = r.Header.Clone()
-		s.Up.Do(model, s.identity(r), w, nr)
+		if wantStream {
+			s.Up.Do(model, s.identity(r), w, nr)
+			return
+		}
+		var chatBody map[string]any
+		if err := json.Unmarshal(raw, &chatBody); err != nil {
+			http.Error(w, "bad json", 400)
+			return
+		}
+		chatBody["model"] = model
+		chatBody["stream"] = true
+		upstream.FingerprintTools(chatBody, false)
+		fwd, _ := json.Marshal(chatBody)
+		status, hdr, body := s.Up.Raw(model, s.identity(r), fwd, r.Header)
+		if status != 200 || !isSSE(hdr, body) {
+			pass(w, status, hdr, body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write(translate.AggregateOpenAI(body, "opencode/"+model))
 		return
 	}
 	respBody := translate.ChatToResponses(chat)

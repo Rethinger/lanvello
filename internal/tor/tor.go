@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -267,6 +269,38 @@ func exitIP(socks string) string {
 	return string(b)
 }
 
+// reapOwnStale kills tor processes belonging to our own lane dirs that still
+// hold ports (leftover from a killed server). Only touches processes whose
+// cmdline references our dataDir, never foreign listeners.
+func reapOwnStale(dataDir string) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		pid := e.Name()
+		if pid == "" || pid[0] < '0' || pid[0] > '9' {
+			continue
+		}
+		if pid == fmt.Sprint(os.Getpid()) {
+			continue
+		}
+		cmd, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
+		if err != nil || len(cmd) == 0 {
+			continue
+		}
+		args := strings.ReplaceAll(string(cmd), "\x00", " ")
+		if !strings.Contains(args, "tor") || !strings.Contains(args, dataDir) {
+			continue
+		}
+		if p, err := strconv.Atoi(pid); err == nil {
+			proc, _ := os.FindProcess(p)
+			_ = proc.Signal(os.Interrupt)
+		}
+	}
+	time.Sleep(1500 * time.Millisecond)
+}
+
 // Ensure starts one tor per lane when no explicit socks are given.
 // It auto-downloads the expert bundle once if no tor binary exists.
 // Missing tor binary is not fatal (lanes stay direct/unhealthy).
@@ -278,6 +312,7 @@ func Ensure(m *lanes.Manager, dataDir string, base, ctrlBase int, timeout time.D
 	if bin == "" {
 		return
 	}
+	reapOwnStale(dataDir)
 	_ = os.Setenv("LANVELLO_TOR_EXE", bin)
 	libPath := filepath.Join(filepath.Dir(bin))
 	env := os.Environ()
