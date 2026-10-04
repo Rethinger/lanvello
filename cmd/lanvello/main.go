@@ -17,7 +17,8 @@ import (
 	"lanvello/internal/upstream"
 )
 
-const version = "0.1.0"
+// stamped in release builds via -ldflags "-X main.version=..."
+var version = "0.1.0"
 
 func main() {
 	if len(os.Args) < 2 {

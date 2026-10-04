@@ -7,6 +7,24 @@ forced streaming, bash/glob/grep/read tool quartet) against
 `https://opencode.ai/zen/v1` with `Bearer public`, exactly like the cli
 does for its free tier. tor lanes rotate exits when an ip is throttled.
 
+## install
+
+prebuilt binaries for linux / macos / windows (amd64, arm64, armv7, 386) —
+every `v*` tag builds them in ci and attaches them to
+[releases](https://github.com/Rethinger/lanvello/releases), no toolchain
+needed:
+
+```
+tar -xzf lanvello_0.1.0_linux_amd64.tar.gz   # .zip on windows
+cd lanvello_0.1.0_linux_amd64 && ./lanvello version
+```
+
+each archive also carries the README; `SHA256SUMS.txt` in the release
+verifies the download. macOS may refuse a freshly downloaded binary —
+unblock it once with `xattr -dr com.apple.quarantine lanvello`.
+
+or build from source (pure go, no cgo):
+
 ```
 go build -o bin/lanvello ./cmd/lanvello
 ./bin/lanvello serve --listen 127.0.0.1:11434 --lanes 5
