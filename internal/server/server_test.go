@@ -57,7 +57,7 @@ func newHarness(t *testing.T, handler func(w http.ResponseWriter, r *http.Reques
 	cl := upstream.NewClient(lm)
 	cl.BaseURL = up.URL
 	cl.WaitBudget = 2 * time.Second
-	h.s = server.New(ks, lm, cl)
+	h.s = server.New(ks, lm, cl, "")
 	h.srv = up
 	h.dir = dir
 	h.key, _, _ = ks.Add("test")
@@ -139,6 +139,78 @@ func TestModelsGoesThroughLane(t *testing.T) {
 		if got[bad] {
 			t.Fatalf("must not advertise %s", bad)
 		}
+	}
+}
+
+// capabilities ride along with the id list: fledge is a reasoning
+// model with selectable effort levels, and the openai list shape
+// stays intact for strict clients.
+func TestModelsCarriesCapabilities(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	rec := h.do(t, "GET", "/v1/models", nil)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var v struct {
+		Data []struct {
+			ID        string `json:"id"`
+			Object    string `json:"object"`
+			OwnedBy   string `json:"owned_by"`
+			Reasoning bool   `json:"reasoning"`
+			Opts      []struct {
+				Type   string   `json:"type"`
+				Values []string `json:"values"`
+			} `json:"reasoning_options"`
+			Limit struct {
+				Context int `json:"context"`
+				Output  int `json:"output"`
+			} `json:"limit"`
+			ContextLength int `json:"context_length"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	var fledge *struct {
+		ID        string `json:"id"`
+		Object    string `json:"object"`
+		OwnedBy   string `json:"owned_by"`
+		Reasoning bool   `json:"reasoning"`
+		Opts      []struct {
+			Type   string   `json:"type"`
+			Values []string `json:"values"`
+		} `json:"reasoning_options"`
+		Limit struct {
+			Context int `json:"context"`
+			Output  int `json:"output"`
+		} `json:"limit"`
+		ContextLength int `json:"context_length"`
+	}
+	for i := range v.Data {
+		if v.Data[i].ID == "opencode/fledge-alpha-free" {
+			fledge = &v.Data[i]
+		}
+	}
+	if fledge == nil {
+		t.Fatalf("fledge missing: %s", rec.Body.String())
+	}
+	if fledge.Object != "model" || fledge.OwnedBy != "opencode" {
+		t.Fatalf("openai shape broken: %+v", fledge)
+	}
+	if !fledge.Reasoning {
+		t.Fatal("fledge must be advertised as a reasoning model")
+	}
+	var efforts []string
+	for _, o := range fledge.Opts {
+		if o.Type == "effort" {
+			efforts = o.Values
+		}
+	}
+	if len(efforts) == 0 {
+		t.Fatalf("fledge must advertise effort levels: %s", rec.Body.String())
+	}
+	if fledge.Limit.Context != 1048576 || fledge.ContextLength != 1048576 {
+		t.Fatalf("context limit missing: %+v", fledge)
 	}
 }
 
@@ -497,7 +569,7 @@ func TestUpstream429RotatesBeforeFirstByte(t *testing.T) {
 	cl := upstream.NewClient(lm)
 	cl.BaseURL = up.URL
 	ks, _ := keys.Open(t.TempDir())
-	s := server.New(ks, lm, cl)
+	s := server.New(ks, lm, cl, "")
 	key, _, _ := ks.Add("k")
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"fledge-alpha-free","stream":true,"messages":[{"role":"user","content":"hi"}]}`))

@@ -83,6 +83,11 @@ func (m *Manager) Lanes() []*Lane {
 	return out
 }
 
+// Direct reports whether lanes bypass tor (test harnesses only).
+// Anything that must never leave through a plain connection — the
+// capability catalog fetch among them — checks this first.
+func (m *Manager) Direct() bool { return m.noTor }
+
 // Countries loads countries.txt like lingling: line1 primary, line2 fallback, line3 preferred.
 func LoadCountriesFile(dataDir string, def, fb []string) ([]string, []string) {
 	p := filepath.Join(dataDir, "countries.txt")

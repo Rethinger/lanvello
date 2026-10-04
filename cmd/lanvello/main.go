@@ -130,7 +130,7 @@ func cmdServe(args []string) {
 	for pref, cc := range cfg.ModelLanes {
 		up.WantCountry[pref] = cc
 	}
-	srv := server.New(ks, m, up)
+	srv := server.New(ks, m, up, cfg.DataDir)
 	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor-only, free, no login\n", version, cfg.Listen, cfg.Lanes)
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -138,17 +138,44 @@ func cmdServe(args []string) {
 	}
 }
 
+// baseFlags lifts the flags baseConfig understands (--config,
+// --data-dir, --listen, --lanes) out of a subcommand's argument
+// list, dropping flags that belong to the subcommand itself
+// (--name): flag.Parse stops at the first unknown flag, so passing
+// the raw list would silently ignore --config and put keys in the
+// wrong data dir.
+func baseFlags(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		name, val, hasVal := strings.Cut(strings.TrimLeft(args[i], "-"), "=")
+		switch name {
+		case "config", "data-dir", "listen", "lanes":
+			if hasVal {
+				out = append(out, "--"+name+"="+val)
+			} else if i+1 < len(args) {
+				out = append(out, "--"+name, args[i+1])
+				i++
+			}
+		}
+	}
+	return out
+}
+
 func cmdKey(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: lanvello key add|list|revoke")
 		os.Exit(2)
 	}
-	cfg := baseConfig([]string{})
+	cfg := baseConfig(baseFlags(args[1:]))
 	ks, _ := openDeps(cfg)
 	switch args[0] {
 	case "add":
 		fs := flag.NewFlagSet("key-add", flag.ContinueOnError)
 		name := fs.String("name", "", "key name")
+		// base flags reach baseFlags before us; declare them here too
+		// so a plain `key add --config ...` line parses without noise
+		fs.String("config", "", "config json path")
+		fs.String("data-dir", "", "state dir")
 		_ = fs.Parse(args[1:])
 		if *name == "" {
 			fmt.Fprintln(os.Stderr, "need --name")
@@ -168,6 +195,8 @@ func cmdKey(args []string) {
 	case "revoke":
 		fs := flag.NewFlagSet("key-revoke", flag.ContinueOnError)
 		name := fs.String("name", "", "key name")
+		fs.String("config", "", "config json path")
+		fs.String("data-dir", "", "state dir")
 		_ = fs.Parse(args[1:])
 		if !ks.Revoke(*name) {
 			fmt.Fprintln(os.Stderr, "not found")
@@ -180,7 +209,7 @@ func cmdKey(args []string) {
 }
 
 func cmdLanes(args []string) {
-	cfg := baseConfig([]string{})
+	cfg := baseConfig(baseFlags(args))
 	_, m := openDeps(cfg)
 	for _, l := range m.Lanes() {
 		fmt.Printf("lane %d cc=%s socks=%s healthy=%v active=%d score=%d\n",

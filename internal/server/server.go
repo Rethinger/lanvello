@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"lanvello/internal/caps"
 	"lanvello/internal/keys"
 	"lanvello/internal/lanes"
 	"lanvello/internal/translate"
@@ -25,14 +26,27 @@ type Server struct {
 	Keys *keys.Store
 	Lane *lanes.Manager
 	Up   *upstream.Client
+	Caps *caps.Store
 
 	catMu    sync.Mutex
-	catCache []string
+	catCache []modelEnt
 	catAt    time.Time
 }
 
-func New(ks *keys.Store, lm *lanes.Manager, up *upstream.Client) *Server {
-	return &Server{Keys: ks, Lane: lm, Up: up}
+// modelEnt is one catalog row: the advertised id plus whatever
+// upstream metadata we keep (the opencode list stamps a created
+// time per model).
+type modelEnt struct {
+	ID      string
+	Created int64
+}
+
+func New(ks *keys.Store, lm *lanes.Manager, up *upstream.Client, dataDir string) *Server {
+	s := &Server{Keys: ks, Lane: lm, Up: up, Caps: caps.Open(dataDir, up, lm)}
+	// warm the capability table in the background; never blocks
+	// startup and never dials directly.
+	go s.Caps.MaybeRefresh()
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -97,9 +111,19 @@ var defaultModels = []string{
 // defaultModel is what an unroutable request lands on.
 const defaultModel = "opencode/muse-spark-1.3-contributor-free"
 
-// catalog asks upstream through a lane (never directly) and caches briefly so
-// a chatty client does not spend a lane per /v1/models call.
+// catalog asks upstream through a lane (never directly) and caches
+// briefly so a chatty client does not spend a lane per /v1/models
+// call. Capabilities ride along from opencode's catalog mirror.
 func (s *Server) catalog() []string {
+	ents := s.catalogEntries()
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		out = append(out, e.ID)
+	}
+	return out
+}
+
+func (s *Server) catalogEntries() []modelEnt {
 	s.catMu.Lock()
 	defer s.catMu.Unlock()
 	if time.Since(s.catAt) < time.Minute && len(s.catCache) > 0 {
@@ -107,26 +131,35 @@ func (s *Server) catalog() []string {
 	}
 	out := s.fetchCatalog()
 	if len(out) == 0 {
-		out = defaultModels
+		out = defaultEntries()
 	}
 	s.catCache, s.catAt = out, time.Now()
 	return out
 }
 
-func (s *Server) fetchCatalog() []string {
+func defaultEntries() []modelEnt {
+	out := make([]modelEnt, 0, len(defaultModels))
+	for _, id := range defaultModels {
+		out = append(out, modelEnt{ID: id})
+	}
+	return out
+}
+
+func (s *Server) fetchCatalog() []modelEnt {
 	status, body := s.Up.GetJSON("/zen/v1/models")
 	if status != 200 || len(body) == 0 {
 		return nil
 	}
 	var v struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &v); err != nil {
 		return nil
 	}
-	var out []string
+	var out []modelEnt
 	for _, m := range v.Data {
 		id := m.ID
 		if id == "jev-1.13-free" {
@@ -138,7 +171,7 @@ func (s *Server) fetchCatalog() []string {
 		if id == "union-alpha" {
 			continue // not actually served by the free tier
 		}
-		out = append(out, "opencode/"+id)
+		out = append(out, modelEnt{ID: "opencode/" + id, Created: m.Created})
 	}
 	if len(out) == 0 {
 		return nil
@@ -161,6 +194,11 @@ func (s *Server) known(id string) bool {
 	return false
 }
 
+// models serves the openai-compatible model list. Ids are live from
+// opencode (through a lane, cached a minute); capability metadata is
+// merged in from opencode's catalog mirror so clients can see
+// reasoning effort levels, limits and modalities. Extra fields are
+// ignored by strict openai clients.
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "method not allowed", 405)
@@ -170,14 +208,45 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
+	s.Caps.MaybeRefresh()
+	capsEntries := s.Caps.Entries()
 	type ent struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		OwnedBy string `json:"owned_by"`
+		ID               string        `json:"id"`
+		Object           string        `json:"object"`
+		Created          int64         `json:"created,omitempty"`
+		OwnedBy          string        `json:"owned_by"`
+		Name             string        `json:"name,omitempty"`
+		Reasoning        bool          `json:"reasoning"`
+		ReasoningOptions []caps.Option `json:"reasoning_options,omitempty"`
+		Limit            *caps.Limit   `json:"limit,omitempty"`
+		ToolCall         bool          `json:"tool_call"`
+		Attachment       bool          `json:"attachment"`
+		Cost             caps.Cost     `json:"cost"`
+		Input            []string      `json:"input,omitempty"`
+		Output           []string      `json:"output,omitempty"`
+		ContextLength    int           `json:"context_length,omitempty"`
+		MaxOutputTokens  int           `json:"max_output_tokens,omitempty"`
 	}
-	var mods []ent
-	for _, id := range s.catalog() {
-		mods = append(mods, ent{ID: id, Object: "model", OwnedBy: "opencode"})
+	mods := []ent{}
+	for _, m := range s.catalogEntries() {
+		e := ent{
+			ID: m.ID, Object: "model", Created: m.Created, OwnedBy: "opencode",
+			ToolCall: true, Attachment: true,
+		}
+		if c, ok := capsEntries[shortID(m.ID)]; ok {
+			e.Name = c.Name
+			e.Reasoning = c.Reasoning
+			e.ReasoningOptions = c.ReasoningOptions
+			e.Limit = &c.Limit
+			e.ToolCall = c.ToolCall
+			e.Attachment = c.Attachment
+			e.Cost = c.Cost
+			e.Input = c.Modalities.Input
+			e.Output = c.Modalities.Output
+			e.ContextLength = c.Limit.Context
+			e.MaxOutputTokens = c.Limit.Output
+		}
+		mods = append(mods, e)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": mods})

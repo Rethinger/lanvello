@@ -348,12 +348,20 @@ func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, h
 // GetJSON fetches a small upstream endpoint through a lane. The model
 // catalog must not leave the machine directly, so it uses the same rotation.
 func (c *Client) GetJSON(path string) (int, []byte) {
+	return c.GetURL(path, c.CatalogBudget)
+}
+
+// GetURL fetches any URL through a lane with an explicit budget. The
+// capability catalog lives on opencode's mirror host, not on the zen
+// api host, so the "path" is a full URL there. As with GetJSON there
+// is no direct egress: the request leaves through whichever lane the
+// rotation picks, or it does not leave at all.
+func (c *Client) GetURL(rawURL string, budget time.Duration) (int, []byte) {
 	var out []byte
-	budget := c.CatalogBudget
 	if budget <= 0 {
 		budget = 20 * time.Second
 	}
-	status, _ := c.loopBudget("catalog", "catalog", "GET", path, nil, nil, budget,
+	status, _ := c.loopBudget("catalog", "catalog", "GET", rawURL, nil, nil, budget,
 		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
 			b, derr := drain(resp)
 			out = b
@@ -514,7 +522,12 @@ func (c *Client) loop(model, identity, method, path string, fwd []byte, in http.
 // loopBudget is loop with an explicit lane-wait budget, so cheap calls (the
 // model catalog) do not sit in the same queue as a 1M-token answer.
 func (c *Client) loopBudget(model, identity, method, path string, fwd []byte, in http.Header, budget time.Duration, consume consumer) (int, error) {
-	url := c.BaseURL + path
+	// path is a bare path (appended to the zen base url) or a full URL
+	// (the capability mirror on another host). Both leave through a lane.
+	url := path
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = c.BaseURL + path
+	}
 	session := identity
 	if !ValidSession(session) {
 		session = c.SessionFor(identity)

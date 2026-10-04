@@ -27,7 +27,15 @@ model:   opencode/muse-spark-1.3-contributor-free
 
 - `GET /v1/models` — the live free catalog, fetched upstream through a lane
   and cached for a minute; only ids the free tier actually serves are
-  advertised (`union-alpha` and `jev-1.13-free` are not among them)
+  advertised (`union-alpha` and `jev-1.13-free` are not among them).
+  each entry carries capability metadata — `reasoning`,
+  `reasoning_options` (selectable effort levels), `limit`
+  (context/output), `tool_call`, `attachment`, `cost`, `input`/`output`
+  modalities, plus `context_length`/`max_output_tokens` aliases — merged
+  in from opencode's catalog mirror (`models.opencode.ai`), which is
+  fetched through a lane, cached on disk for 6h and refreshed in the
+  background. the embedded table for the known free models is the
+  offline fallback, so a dead mirror never breaks the list
 - `POST /v1/chat/completions` — openai chat. responses-backed models
   (muse-spark) are translated chat -> responses upstream and back to
   openai sse (or aggregated when `stream:false`); the rest pass through
@@ -98,8 +106,48 @@ least-loaded lane. 429 handling is per exit ip with `retry-after` respected,
 exactly the free-tier bypass. note that a lane held by a long answer cannot
 answer a catalog call until it frees up, hence `catalogBudgetS`.
 
-every byte leaves through a lane, including the model catalog: there is no
-code path in `internal/upstream` that dials the free tier directly.
+every byte leaves through a lane, including the model catalog and the
+capability mirror: there is no code path in `internal/upstream` that
+dials the free tier directly.
+
+## harness integration
+
+`examples/lanvello-ext.mjs` registers the provider for pi-family
+harnesses (omp, prime-agent) and fetches the model list from the
+gateway at load — an async factory, so new free models appear without
+editing anything:
+
+```
+LANVELLO_API_KEY=<key> prime-agent -e examples/lanvello-ext.mjs
+```
+
+omp can also discover the list on its own via models.yml:
+
+```yaml
+providers:
+  lanvello:
+    baseUrl: http://127.0.0.1:11448/v1
+    apiKey: sk-lanv-...        # literal value: omp does not expand ${ENV} here
+    api: openai-completions
+    discovery:
+      type: openai-models-list
+    modelOverrides:
+      opencode/fledge-alpha-free:
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts: [low, high, max]
+          defaultLevel: low
+        compat:
+          supportsReasoningEffort: true
+```
+
+omp resolves reasoning flags from its own bundled catalog, which does
+not know the free models, so effort levels are declared per model id
+in `modelOverrides` (the list itself stays dynamic via `discovery`).
+`compat.supportsReasoningEffort: true` is required: without it omp
+treats an unrecognized model id as effort-incapable and silently
+drops `reasoning_effort` from the request.
 
 ## deploy
 
