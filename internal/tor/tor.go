@@ -332,6 +332,7 @@ func Ensure(m *lanes.Manager, dataDir string, base, ctrlBase int, timeout time.D
 		if err := cmd.Start(); err != nil {
 			continue
 		}
+		l.SetProcess(cmd)
 		addr := fmt.Sprintf("127.0.0.1:%d", socks)
 		if waitPort(addr, timeout) {
 			l.SocksAddr = addr
@@ -339,4 +340,41 @@ func Ensure(m *lanes.Manager, dataDir string, base, ctrlBase int, timeout time.D
 			l.ExitIP = exitIP(addr)
 		}
 	}
+}
+
+// Respawn restarts one lane's tor process with its current (rotated) country
+// and hands the fresh exit back to the manager. Called from the manager's
+// OnRotate hook when a 429 retires the lane.
+func Respawn(m *lanes.Manager, l *lanes.Lane, dataDir string, base, ctrlBase int, timeout time.Duration) {
+	bin := FindTor()
+	if bin == "" {
+		m.RotateFailed(l)
+		return
+	}
+	if old := l.Process(); old != nil && old.Process != nil {
+		_ = old.Process.Kill()
+		_, _ = old.Process.Wait()
+	}
+	socks := base + l.Index - 1
+	ctrl := ctrlBase + l.Index - 1
+	dir := filepath.Join(dataDir, "lanes", fmt.Sprintf("tor-%d", l.Index))
+	if err := writeTorrc(bin, dir, socks, ctrl, l.Country); err != nil {
+		m.RotateFailed(l)
+		return
+	}
+	env := append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Dir(bin))
+	cmd := exec.Command(bin, "-f", filepath.Join(dir, "torrc"))
+	cmd.Env = env
+	if err := cmd.Start(); err != nil {
+		m.RotateFailed(l)
+		return
+	}
+	l.SetProcess(cmd)
+	addr := fmt.Sprintf("127.0.0.1:%d", socks)
+	if !waitPort(addr, timeout) {
+		_ = cmd.Process.Kill()
+		m.RotateFailed(l)
+		return
+	}
+	m.RotateDone(l, addr, exitIP(addr))
 }

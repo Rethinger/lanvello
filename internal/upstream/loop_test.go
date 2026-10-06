@@ -3,6 +3,7 @@ package upstream
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -229,5 +230,34 @@ func TestIdleBodyFailsStalledRead(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("idle guard too slow: %s", time.Since(start))
+	}
+}
+
+// A stream that never starts (no lane up, upstream unreachable) must answer
+// with a real status. It used to return without writing anything, which
+// net/http turned into an empty 200 that hid the failure.
+func TestStreamAnswers502WhenNothingStarts(t *testing.T) {
+	m := lanes.New(t.TempDir(), []string{"us"}, nil, nil, true, 1)
+	c := NewClient(m)
+	c.BaseURL = "http://127.0.0.1:1" // nothing listens here
+	c.WaitBudget = 300 * time.Millisecond
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := c.StreamEvents("fledge-alpha-free", "k", []byte(`{"messages":[]}`), nil, w,
+			func(payload string, ev map[string]any) ([]string, bool) { return nil, false }); err == nil {
+			t.Errorf("a dead upstream must surface an error")
+		}
+	}))
+	defer hs.Close()
+	resp, err := http.Get(hs.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502 (an empty 200 hides the failure)", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "error") {
+		t.Fatalf("body=%q", b)
 	}
 }

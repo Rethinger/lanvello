@@ -457,6 +457,7 @@ func (e *StreamError) Error() string { return e.Err.Error() }
 // another lane before a single byte is written downstream.
 func (c *Client) stream(model, identity string, fwd []byte, in http.Header, w http.ResponseWriter, body func(sink *streamSink, resp *http.Response) error) (int, error) {
 	var sink *streamSink
+	committed := false
 	status, err := c.loop(model, identity, "POST", endpointFor(model), fwd, in,
 		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
 			if retryable(st) {
@@ -466,6 +467,7 @@ func (c *Client) stream(model, identity string, fwd []byte, in http.Header, w ht
 			if st != 200 {
 				b, _ := drain(resp)
 				relay(w, st, hdr, b)
+				committed = true
 				return true, nil
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -473,10 +475,22 @@ func (c *Client) stream(model, identity string, fwd []byte, in http.Header, w ht
 			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(200)
+			committed = true
 			sink = &streamSink{w: w}
 			sink.flush()
 			return true, body(sink, resp)
 		})
+	if err != nil && !committed {
+		// Nothing was written downstream yet (no lane up, upstream down):
+		// answer with a real status. Returning without a body let net/http
+		// send an empty 200, hiding the failure from the client.
+		st := http.StatusBadGateway
+		if se, ok := err.(*StreamError); ok && se.Status != 0 {
+			st = se.Status
+		}
+		relay(w, st, jsonHeader(), []byte(`{"error":`+quote(err.Error())+`}`))
+		return st, err
+	}
 	if err != nil {
 		if se, ok := err.(*StreamError); ok {
 			return se.Status, se.Err
