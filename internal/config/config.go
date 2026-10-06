@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Config struct {
@@ -21,6 +22,9 @@ type Config struct {
 	// CatalogBudgetS bounds the lane wait for /v1/models, which must stay
 	// snappy even when every lane is busy with a long answer.
 	CatalogBudgetS float64 `json:"catalogBudgetS"`
+	// RequireKey refuses keyless /v1 requests even before the first key is
+	// issued: a public deployment must never fall back to open mode.
+	RequireKey bool `json:"requireKey"`
 }
 
 func DefaultDataDir() string {
@@ -44,7 +48,16 @@ func Defaults() Config {
 		Countries:      []string{"us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"},
 		WaitBudgetS:    90,
 		CatalogBudgetS: 20,
+		RequireKey:     envBool("LANVELLO_REQUIRE_KEY"),
 	}
+}
+
+func envBool(k string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(k))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func envOr(k, d string) string {
@@ -99,6 +112,9 @@ func LoadFile(path string, base Config) (Config, error) {
 	}
 	if f.CatalogBudgetS > 0 {
 		base.CatalogBudgetS = f.CatalogBudgetS
+	}
+	if f.RequireKey {
+		base.RequireKey = true
 	}
 	if len(f.ModelLanes) > 0 {
 		if base.ModelLanes == nil {

@@ -553,6 +553,34 @@ func TestResponsesNativeStreamRelayed(t *testing.T) {
 	}
 }
 
+// A stream:false native responses client gets one response object, not sse.
+func TestResponsesNonStreamAggregates(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/zen/v1/responses" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		sseWriter(w, responsesTextStream("Hello")...)
+	})
+	rec := h.do(t, "POST", "/v1/responses", map[string]any{
+		"model": "muse-spark-1.3-contributor-free", "stream": false,
+		"input": "hi",
+	})
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "event:") || strings.Contains(body, "data:") {
+		t.Fatalf("sse leaked to a stream:false client:\n%s", body)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatal(body)
+	}
+	if v["id"] != "resp_abc" {
+		t.Fatalf("id=%v", v["id"])
+	}
+}
+
 func TestUpstream429RotatesBeforeFirstByte(t *testing.T) {
 	var n int
 	lm := lanes.New(t.TempDir(), []string{"us", "de"}, nil, nil, true, 2)
@@ -597,10 +625,10 @@ func TestBodyLimit(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+h.key)
 	rec := httptest.NewRecorder()
 	h.s.Handler().ServeHTTP(rec, req)
-	// 200MB+1 of json is not a valid short request: whatever happens, the
-	// process must survive and answer with a status, not hang or crash.
-	if rec.Code == 0 {
-		t.Fatal("no status written")
+	// 200MB of json is over the 128MB cap: it must be refused with a real
+	// status, not silently truncated.
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body must be refused with 413, got %d", rec.Code)
 	}
 }
 
@@ -622,6 +650,34 @@ func TestBadKeyRejected(t *testing.T) {
 	h.s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("code=%d", rec.Code)
+	}
+}
+
+// With no keys issued yet the API defaults to open mode (localhost dev); a
+// public deployment sets requireKey and an empty store must refuse instead.
+func TestRequireKeyClosesOpenMode(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	dir := t.TempDir()
+	ks, _ := keys.Open(dir)
+	lm := lanes.New(dir, []string{"de"}, nil, nil, true, 1)
+	cl := upstream.NewClient(lm)
+	cl.BaseURL = h.srv.URL
+	cl.WaitBudget = 2 * time.Second
+	s := server.New(ks, lm, cl, "")
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("default open mode must still answer: %d", rec.Code)
+	}
+
+	s.RequireKey = true
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/v1/models", nil)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("requireKey must refuse keyless requests: %d", rec.Code)
 	}
 }
 

@@ -27,6 +27,10 @@ type Server struct {
 	Lane *lanes.Manager
 	Up   *upstream.Client
 	Caps *caps.Store
+	// RequireKey refuses keyless /v1 requests even before the first key is
+	// issued (config `requireKey` / LANVELLO_REQUIRE_KEY): a public
+	// deployment must never fall back to open mode.
+	RequireKey bool
 
 	catMu    sync.Mutex
 	catCache []modelEnt
@@ -77,7 +81,7 @@ func (s *Server) identity(r *http.Request) string {
 
 func (s *Server) authed(r *http.Request) bool {
 	if len(s.Keys.List()) == 0 {
-		return true // open mode: no keys issued yet
+		return !s.RequireKey // open mode: no keys issued yet
 	}
 	sec := keys.BearerOf(r.Header.Get("Authorization"))
 	if sec == "" {
@@ -260,9 +264,13 @@ func shortID(id string) string {
 }
 
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
 		http.Error(w, "read body", 400)
+		return nil, false
+	}
+	if int64(len(raw)) > maxBody {
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 		return nil, false
 	}
 	return raw, true
@@ -427,8 +435,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if !s.known(model) {
 		model = shortID(defaultModel)
 	}
+	// Read the client's intent BEFORE fingerprintResponses forces stream=true
+	// on this same map — otherwise every stream:false request took the relay
+	// branch below and got raw sse back.
+	wantStream, _ := body["stream"].(bool)
 	fwd := s.fingerprintResponses(body, model)
-	if stream, _ := body["stream"].(bool); stream {
+	if wantStream {
 		b, err := json.Marshal(fwd)
 		if err != nil {
 			http.Error(w, "encode", 500)
@@ -446,6 +458,17 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status, hdr, respBody := s.Up.Raw(model, s.identity(r), b, r.Header)
+	// A stream:false client asked for one response object; upstream still
+	// answers sse (the fingerprint forces streaming), so fold the terminal
+	// event back into the response JSON instead of leaking sse bytes.
+	if status == 200 && isSSE(hdr, respBody) {
+		if agg, ok := translate.AggregateResponsesObject(respBody); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write(agg)
+			return
+		}
+	}
 	pass(w, status, hdr, respBody)
 }
 

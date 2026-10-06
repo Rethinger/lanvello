@@ -553,6 +553,25 @@ func AggregateResponses(sse []byte, model string) []byte {
 	return mustJSON(resp)
 }
 
+// AggregateResponsesObject folds a native responses sse stream into the one
+// response object a stream:false client expects: the terminal event carries
+// the full response. ok=false when the stream never completed.
+func AggregateResponsesObject(sse []byte) ([]byte, bool) {
+	var last map[string]any
+	forEachPayload(sse, func(ev map[string]any) {
+		switch t, _ := ev["type"].(string); t {
+		case "response.completed", "response.failed", "response.incomplete":
+			if r, ok := ev["response"].(map[string]any); ok {
+				last = r
+			}
+		}
+	})
+	if last == nil {
+		return nil, false
+	}
+	return mustJSON(last), true
+}
+
 // AggregateOpenAI collects openai sse chunks into one chat completion.
 func AggregateOpenAI(sse []byte, model string) []byte {
 	var sb, reason strings.Builder

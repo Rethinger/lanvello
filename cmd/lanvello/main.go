@@ -137,6 +137,7 @@ func cmdServe(args []string) {
 		up.WantCountry[pref] = cc
 	}
 	srv := server.New(ks, m, up, cfg.DataDir)
+	srv.RequireKey = cfg.RequireKey
 	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor-only, free, no login\n", version, cfg.Listen, cfg.Lanes)
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
