@@ -457,15 +457,23 @@ func (e *StreamError) Error() string { return e.Err.Error() }
 // another lane before a single byte is written downstream.
 func (c *Client) stream(model, identity string, fwd []byte, in http.Header, w http.ResponseWriter, body func(sink *streamSink, resp *http.Response) error) (int, error) {
 	var sink *streamSink
+	committed := false
+	// The last retryable answer is kept so a loop that gives up (a plainly
+	// down endpoint) relays the real status instead of an empty 200.
+	var lastSt int
+	var lastHdr http.Header
+	var lastBody []byte
 	status, err := c.loop(model, identity, "POST", endpointFor(model), fwd, in,
 		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
 			if retryable(st) {
-				_, _ = drain(resp)
+				lastBody, _ = drain(resp)
+				lastSt, lastHdr = st, hdr
 				return false, nil
 			}
 			if st != 200 {
 				b, _ := drain(resp)
 				relay(w, st, hdr, b)
+				committed = true
 				return true, nil
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -473,10 +481,28 @@ func (c *Client) stream(model, identity string, fwd []byte, in http.Header, w ht
 			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(200)
+			committed = true
 			sink = &streamSink{w: w}
 			sink.flush()
 			return true, body(sink, resp)
 		})
+	if err == nil && !committed && lastSt != 0 {
+		// The retries were spent on a far-end failure: hand the drained
+		// upstream answer back instead of nothing.
+		relay(w, lastSt, lastHdr, lastBody)
+		return lastSt, nil
+	}
+	if err != nil && !committed {
+		// Nothing was written downstream yet (no lane up, upstream down):
+		// answer with a real status. Returning without a body let net/http
+		// send an empty 200, hiding the failure from the client.
+		st := http.StatusBadGateway
+		if se, ok := err.(*StreamError); ok && se.Status != 0 {
+			st = se.Status
+		}
+		relay(w, st, jsonHeader(), []byte(`{"error":`+quote(err.Error())+`}`))
+		return st, err
+	}
 	if err != nil {
 		if se, ok := err.(*StreamError); ok {
 			return se.Status, se.Err
@@ -542,6 +568,7 @@ func (c *Client) loopBudget(model, identity, method, path string, fwd []byte, in
 	reqID := deriveRequestID(session, lastUserText(probe))
 
 	tried := map[int]bool{}
+	farFails := 0
 	deadline := time.Now().Add(budget)
 	var lastErr string
 	wantCC := c.countryFor(model)
@@ -581,6 +608,13 @@ func (c *Client) loopBudget(model, identity, method, path string, fwd []byte, in
 			continue
 		case st == 502 || st == 503 || st == 504:
 			if stop {
+				return st, cerr
+			}
+			// Far-end failures earn another exit, but a model whose
+			// endpoint is plainly down must not spin until the deadline:
+			// after two full passes the real status goes to the caller.
+			farFails++
+			if farFails >= 2*len(c.Lanes.Lanes()) {
 				return st, cerr
 			}
 			continue

@@ -73,3 +73,17 @@ func TestLoadFileRejectsGarbage(t *testing.T) {
 		t.Fatal("garbage config must be an error, not silently defaulted")
 	}
 }
+
+func TestLoadFileRequireKey(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "c.json")
+	if err := os.WriteFile(p, []byte(`{"requireKey":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFile(p, Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RequireKey {
+		t.Fatalf("requireKey lost: %+v", cfg)
+	}
+}

@@ -26,6 +26,11 @@ type Store struct {
 	path string
 	mu   sync.Mutex
 	en   []Entry
+	// mtime/size of the keys.json the in-memory list came from. A change on
+	// disk (lanvello key add/revoke runs in another process) is picked up on
+	// the next request instead of requiring a restart.
+	mtime int64
+	size  int64
 }
 
 func Path(dataDir string) string { return filepath.Join(dataDir, "keys.json") }
@@ -48,7 +53,40 @@ func Open(dataDir string) (*Store, error) {
 	if err := json.Unmarshal(b, &s.en); err != nil {
 		return nil, err
 	}
+	s.stamp()
 	return s, nil
+}
+
+// stamp records the current file identity so maybeReload can tell later
+// writes apart. Best-effort: a missing file simply never matches.
+func (s *Store) stamp() {
+	if st, err := os.Stat(s.path); err == nil {
+		s.mtime, s.size = st.ModTime().UnixNano(), st.Size()
+	}
+}
+
+// maybeReload re-reads keys.json when another process changed it. Callers
+// hold s.mu. Best-effort: a torn or unparsable read keeps the in-memory list.
+func (s *Store) maybeReload() {
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return
+	}
+	if st.ModTime().UnixNano() == s.mtime && st.Size() == s.size {
+		return
+	}
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		return
+	}
+	var en []Entry
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &en); err != nil {
+			return
+		}
+	}
+	s.en = en
+	s.mtime, s.size = st.ModTime().UnixNano(), st.Size()
 }
 
 func (s *Store) save() error {
@@ -60,7 +98,11 @@ func (s *Store) save() error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.stamp()
+	return nil
 }
 
 func hashOf(secret string) string {
@@ -72,6 +114,7 @@ func hashOf(secret string) string {
 func (s *Store) Add(name string) (string, Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.maybeReload()
 	var raw [24]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", Entry{}, err
@@ -100,6 +143,7 @@ func (s *Store) Add(name string) (string, Entry, error) {
 func (s *Store) List() []Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.maybeReload()
 	cp := make([]Entry, len(s.en))
 	copy(cp, s.en)
 	return cp
@@ -108,6 +152,7 @@ func (s *Store) List() []Entry {
 func (s *Store) Revoke(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.maybeReload()
 	found := false
 	out := s.en[:0]
 	for _, x := range s.en {
@@ -129,6 +174,7 @@ func (s *Store) Revoke(name string) bool {
 func (s *Store) Verify(secret string, allowEmpty bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.maybeReload()
 	if secret == "" {
 		return false
 	}

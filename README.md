@@ -89,14 +89,18 @@ reasoning encrypted, so there only the token counts show up.
 
 auth: bearer `sk-lanv-...` from `key add`. fresh data dir with zero keys
 runs open (single-user localhost); the moment one key exists, all `/v1/*`
-require it. one stable `x-opencode-session` is derived per api key:
-minting a fresh session per request burns free quota into 429s.
+require it. on a public endpoint set `requireKey` in the config (or
+`LANVELLO_REQUIRE_KEY=1`) so an empty data dir refuses instead of serving
+open. keys.json is re-read when it changes, so `key add` / `key revoke`
+take effect without a restart. one stable `x-opencode-session` is derived
+per api key: minting a fresh session per request burns free quota into 429s.
 
 ## limits
 
-429 retires the lane exit until `retry-after` and rotates country, request is
-retried on another lane. 502/503/504 retry on another lane. per-request
-proof goes to `$dataDir/proof.jsonl`.
+429 retires the lane exit until `retry-after`; with tor lanes the process is
+respawned in the background for a fresh exit and the lane returns once it is
+up, while the request is retried on another lane. 502/503/504 retry on
+another lane. per-request proof goes to `$dataDir/proof.jsonl`.
 
 a lane stays busy for the whole answer, not just while the request is in
 flight, so N lanes means N concurrent answers; the rest wait in the queue up

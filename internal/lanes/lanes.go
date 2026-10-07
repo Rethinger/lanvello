@@ -26,6 +26,7 @@ type Lane struct {
 	Score       int
 	Healthy     bool
 	Healing     bool
+	Rotating    bool
 	LastUsed    time.Time
 	LastReal    time.Time
 	cmd         *exec.Cmd
@@ -52,6 +53,10 @@ type Manager struct {
 	fallback  []string
 	noTor     bool
 	seq       int
+	// OnRotate, when set (tor-spawned lanes), respawns the lane's process so
+	// a 429 lands on a fresh exit. The lane stays retired until RotateDone
+	// reports the new exit.
+	OnRotate func(*Lane)
 }
 
 func New(dataDir string, countries, fallback []string, socks []string, noTor bool, count int) *Manager {
@@ -182,7 +187,7 @@ func (m *Manager) pick(exclude map[int]bool, cc string) *Lane {
 		if exclude != nil && exclude[l.Index] {
 			continue
 		}
-		if !l.Healthy || l.Healing {
+		if !l.Healthy || l.Healing || l.Rotating {
 			continue
 		}
 		if cc != "" && l.Country != cc {
@@ -265,10 +270,12 @@ func (m *Manager) NoteLimited(l *Lane, retryAfter time.Duration) time.Time {
 	return l.LimitedTill
 }
 
-// Rotate moves lane to the best country with spare capacity (simple score sort).
+// Rotate retires the lane's exit after a 429 and asks OnRotate (tor respawn,
+// when the lanes are tor-spawned) for a fresh one in the best-scoring
+// country. The retry-after limit is kept until the new exit is up — clearing
+// it here handed the same limited exit straight back to the next request.
 func (m *Manager) Rotate(l *Lane) string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	pool := append(append([]string{}, m.countries...), m.fallback...)
 	seen := map[string]bool{}
 	var ranked []string
@@ -291,11 +298,50 @@ func (m *Manager) Rotate(l *Lane) string {
 			continue
 		}
 		l.Country = c
-		l.LimitedTill = time.Time{}
-		return c
+		break
 	}
-	return l.Country
+	hook := m.OnRotate
+	if hook != nil && !l.Rotating {
+		l.Rotating = true
+		go hook(l)
+	}
+	cc := l.Country
+	m.mu.Unlock()
+	return cc
 }
+
+// RotateDone reports a lane's fresh exit (a respawn finished): the lane is
+// usable again and its retry-after limit is lifted.
+func (m *Manager) RotateDone(l *Lane, socks, ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if socks != "" {
+		l.SocksAddr = socks
+		l.Healthy = true
+	}
+	l.ExitIP = ip
+	l.Rotating = false
+	l.LimitedTill = time.Time{}
+}
+
+// RotateFailed clears the rotating flag after a failed respawn. The lane
+// keeps its retry-after limit (with a cooldown floor) so the next request
+// does not immediately try to rotate it again.
+func (m *Manager) RotateFailed(l *Lane) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l.Rotating = false
+	if floor := time.Now().Add(5 * time.Minute); l.LimitedTill.Before(floor) {
+		l.LimitedTill = floor
+	}
+}
+
+// SetProcess records the tor process backing this lane so rotation can
+// replace it; nil for lanes that are not tor-spawned.
+func (l *Lane) SetProcess(cmd *exec.Cmd) { l.cmd = cmd }
+
+// Process returns the tor process backing this lane, if any.
+func (l *Lane) Process() *exec.Cmd { return l.cmd }
 
 func (m *Manager) Emit(p Proof) {
 	m.mu.Lock()

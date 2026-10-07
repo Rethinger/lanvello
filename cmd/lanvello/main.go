@@ -116,6 +116,11 @@ func cmdServe(args []string) {
 	// tor-only: direct egress is gone. without tor lanes there is no service.
 	if len(cfg.Socks) == 0 {
 		tor.Ensure(m, cfg.DataDir, 52001, 52301, 90*time.Second)
+		// A 429 rotates the lane: respawn its tor in the background so the
+		// next request lands on a fresh exit.
+		m.OnRotate = func(l *lanes.Lane) {
+			tor.Respawn(m, l, cfg.DataDir, 52001, 52301, 90*time.Second)
+		}
 	}
 	if n := healthySocks(m); n == 0 {
 		fmt.Fprintln(os.Stderr, "no tor lanes up (tor binary missing or bootstrap failed) -- refusing to serve direct")
@@ -132,6 +137,7 @@ func cmdServe(args []string) {
 		up.WantCountry[pref] = cc
 	}
 	srv := server.New(ks, m, up, cfg.DataDir)
+	srv.RequireKey = cfg.RequireKey
 	fmt.Printf("lanvello %s listening on http://%s lanes=%d tor-only, free, no login\n", version, cfg.Listen, cfg.Lanes)
 	if err := http.ListenAndServe(cfg.Listen, srv.Handler()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
