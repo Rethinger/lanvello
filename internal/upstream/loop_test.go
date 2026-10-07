@@ -261,3 +261,58 @@ func TestStreamAnswers502WhenNothingStarts(t *testing.T) {
 		t.Fatalf("body=%q", b)
 	}
 }
+
+// A far-end that is plainly down (503 every time) must not spin until the
+// wait budget: after a couple of full passes the real answer goes back.
+func TestRawBailsOnPersistent503(t *testing.T) {
+	var hits int32
+	c, _ := testClient(t, 3, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		fmt.Fprint(w, `{"error":{"type":"server_error","message":"Endpoint is unavailable."}}`)
+	})
+	c.WaitBudget = 60 * time.Second // would spin for a minute without the bound
+	start := time.Now()
+	status, _, body := c.Raw("fledge-alpha-free", "k", []byte(`{"messages":[]}`), nil)
+	if status != 503 {
+		t.Fatalf("status=%d, want 503", status)
+	}
+	if !strings.Contains(string(body), "Endpoint is unavailable") {
+		t.Fatalf("real upstream error lost: %q", string(body))
+	}
+	if n := atomic.LoadInt32(&hits); n > 8 {
+		t.Fatalf("retried %d times, the bound is not working", n)
+	}
+	if d := time.Since(start); d > 15*time.Second {
+		t.Fatalf("spun %s instead of bailing", d)
+	}
+}
+
+// Same for the streaming path: the drained upstream answer must be relayed
+// to the client instead of an empty 200.
+func TestStreamRelaysPersistent503(t *testing.T) {
+	c, _ := testClient(t, 3, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		fmt.Fprint(w, `{"error":{"type":"server_error","message":"Endpoint is unavailable."}}`)
+	})
+	c.WaitBudget = 60 * time.Second
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = c.StreamEvents("fledge-alpha-free", "k", []byte(`{"messages":[]}`), nil, w,
+			func(payload string, ev map[string]any) ([]string, bool) { return nil, false })
+	}))
+	defer hs.Close()
+	resp, err := http.Get(hs.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("status=%d, want 503", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "Endpoint is unavailable") {
+		t.Fatalf("body=%q", b)
+	}
+}
