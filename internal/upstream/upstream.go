@@ -334,9 +334,14 @@ func (c *Client) Raw(model, identity string, fwd []byte, in http.Header) (int, h
 			outH = hdr
 			b, derr := drain(resp)
 			outB = b
-			return !retryable(st), derr
+			// a body cut mid-way is not an answer: nothing went downstream yet, so the loop may try another lane
+			return derr == nil && !retryable(st), derr
 		})
 	if err != nil {
+		if status < 300 {
+			// the header said 200 but the body never arrived whole: the caller must see a failure it can retry
+			status = 502
+		}
 		return status, jsonHeader(), []byte(`{"error":` + quote(err.Error()) + `}`)
 	}
 	if outH == nil {
@@ -365,7 +370,7 @@ func (c *Client) GetURL(rawURL string, budget time.Duration) (int, []byte) {
 		func(resp *http.Response, st int, hdr http.Header) (bool, error) {
 			b, derr := drain(resp)
 			out = b
-			return !retryable(st), derr
+			return derr == nil && !retryable(st), derr
 		})
 	return status, out
 }
@@ -624,6 +629,16 @@ func (c *Client) loopBudget(model, identity, method, path string, fwd []byte, in
 				continue
 			}
 			return st, cerr
+		case cerr != nil && !stop && st < 300:
+			// The header was fine but the body broke off ("unexpected EOF") and nothing was committed downstream:
+			// a far-end failure like a 502, worth another exit, bounded like the 5xx case.
+			lastErr = cerr.Error()
+			c.Lanes.Emit(lanes.Proof{T: time.Now(), Lane: lane.Index, Country: lane.Country, IP: lane.ExitIP, Model: model, Status: 502, Note: "body cut: " + lastErr})
+			farFails++
+			if farFails >= 2*len(c.Lanes.Lanes()) || time.Now().After(deadline) {
+				return 502, cerr
+			}
+			continue
 		default:
 			// committed answer: score the exit and leave a proof row
 			c.Lanes.NoteResult(lane.Country, st)
