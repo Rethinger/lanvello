@@ -316,3 +316,52 @@ func TestStreamRelaysPersistent503(t *testing.T) {
 		t.Fatalf("body=%q", b)
 	}
 }
+
+// cutBody answers 200 and a promised body, then drops the connection half way: the client reads "unexpected EOF".
+func cutBody(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	conn, buf, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(buf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\n\r\ndata: {\"id\":\"c1\"")
+	_ = buf.Flush()
+	_ = conn.Close()
+}
+
+func TestRawRetriesABodyCutOffOnAnotherLane(t *testing.T) {
+	var n int64
+	c, _ := testClient(t, 2, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&n, 1) == 1 {
+			cutBody(t, w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sseBody("whole"))
+	})
+	status, _, body := c.Raw("big-pickle", "id", []byte(`{"model":"big-pickle","messages":[]}`), nil)
+	if status != 200 || !strings.Contains(string(body), "whole") {
+		t.Fatalf("status=%d body=%s: a cut body must be fetched again, not returned", status, body)
+	}
+	if atomic.LoadInt64(&n) != 2 {
+		t.Fatalf("attempts=%d, want 2", n)
+	}
+}
+
+func TestRawNeverReportsACutBodyAsSuccess(t *testing.T) {
+	var n int64
+	c, _ := testClient(t, 2, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&n, 1)
+		cutBody(t, w)
+	})
+	status, _, body := c.Raw("big-pickle", "id", []byte(`{"model":"big-pickle","messages":[]}`), nil)
+	if status != 502 {
+		t.Fatalf("status=%d body=%s: an answer that never arrived whole is a 502, not a 200", status, body)
+	}
+	if !strings.Contains(string(body), `"error":"`) || len(body) < 20 {
+		t.Fatalf("body=%s should carry the read error", body)
+	}
+	if got := atomic.LoadInt64(&n); got < 2 || got > 4 {
+		t.Fatalf("attempts=%d: retried on other lanes, but bounded (2 passes over 2 lanes)", got)
+	}
+}
