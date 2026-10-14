@@ -4,14 +4,20 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"lanvello/internal/bridge"
 	"lanvello/internal/caps"
+	"lanvello/internal/clientapi"
 	"lanvello/internal/keys"
 	"lanvello/internal/lanes"
 	"lanvello/internal/translate"
@@ -27,6 +33,17 @@ type Server struct {
 	Lane *lanes.Manager
 	Up   *upstream.Client
 	Caps *caps.Store
+	// ClientAPI, when set, is where inference goes: the running opencode
+	// client makes the call (it holds the free-tier session), we translate.
+	// The replay path (Up) cannot serve the free tier at all any more, so
+	// this is not an optimisation, it is the only way in.
+	ClientAPI *clientapi.Client
+	// BridgeDir is where a caller's request is parked for the client-side
+	// plugin (system, history, tools). Empty disables the bridge: the client
+	// then answers with its own agent and its own tools.
+	BridgeDir string
+	// pollGap is how often the client's session is read while answering.
+	pollGap time.Duration
 	// RequireKey refuses keyless /v1 requests even before the first key is
 	// issued (config `requireKey` / LANVELLO_REQUIRE_KEY): a public
 	// deployment must never fall back to open mode.
@@ -46,7 +63,7 @@ type modelEnt struct {
 }
 
 func New(ks *keys.Store, lm *lanes.Manager, up *upstream.Client, dataDir string) *Server {
-	s := &Server{Keys: ks, Lane: lm, Up: up, Caps: caps.Open(dataDir, up, lm)}
+	s := &Server{Keys: ks, Lane: lm, Up: up, Caps: caps.Open(dataDir, up, lm), pollGap: 250 * time.Millisecond}
 	// warm the capability table in the background; never blocks
 	// startup and never dials directly.
 	go s.Caps.MaybeRefresh()
@@ -150,6 +167,25 @@ func defaultEntries() []modelEnt {
 }
 
 func (s *Server) fetchCatalog() []modelEnt {
+	// Client-backed: the client is the authority on what it can drive, and its
+	// list needs no lane (the catalog mirror is not gated, but the client has
+	// already fetched it).
+	if s.ClientAPI != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if mods, err := s.ClientAPI.Models(ctx); err == nil {
+			var out []modelEnt
+			for _, m := range mods {
+				if m.ProviderID != "opencode" || m.ID == "" {
+					continue
+				}
+				out = append(out, modelEnt{ID: "opencode/" + m.ID})
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
 	status, body := s.Up.GetJSON("/zen/v1/models")
 	if status != 200 || len(body) == 0 {
 		return nil
@@ -306,6 +342,13 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	wantStream, _ := chat["stream"].(bool)
 	id := s.identity(r)
 
+	// The free tier leases a session to the running client, so when one is
+	// wired up the client is the upstream: our own request cannot get in.
+	if s.ClientAPI != nil {
+		s.chatViaClient(w, r, chat, model, wantStream)
+		return
+	}
+
 	if !upstream.IsResponsesModel(model) {
 		fwd := s.fingerprintChat(chat)
 		if wantStream {
@@ -342,6 +385,316 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	_, _ = w.Write(translate.AggregateResponsesConv(body, "opencode/"+model))
+}
+
+// chatViaClient answers one chat request through the running opencode client.
+//
+// The request is parked in the bridge spool (when the plugin is installed), so
+// the client-side plugin can rebuild the model call from the caller's own
+// system prompt, history and tool schemas — the client's http api takes nothing
+// but text. Tool calls the model makes are recorded by the plugin instead of
+// being executed, and come back here as an openai tool_calls turn.
+func (s *Server) chatViaClient(w http.ResponseWriter, r *http.Request, chat map[string]any, model string, wantStream bool) {
+	req := parseChatRequest(chat)
+	if req.Prompt == "" {
+		http.Error(w, "chat requires messages", 400)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+	defer cancel()
+
+	sessionID, err := s.ClientAPI.Create(ctx, "opencode", model, req.Variant)
+	if err != nil {
+		clientError(w, err)
+		return
+	}
+	defer s.ClientAPI.Drop(context.WithoutCancel(ctx), sessionID)
+	if s.BridgeDir != "" {
+		parked := bridge.Request{SessionID: sessionID, System: req.System, Messages: req.Messages, Tools: req.Tools, Model: model}
+		if err := bridge.Write(s.BridgeDir, parked); err != nil {
+			clientError(w, err)
+			return
+		}
+		defer bridge.Remove(s.BridgeDir, sessionID)
+	}
+	if err := s.ClientAPI.Prompt(ctx, sessionID, req.Prompt); err != nil {
+		clientError(w, err)
+		return
+	}
+
+	id := "chatcmpl-" + randHex(16)
+	created := time.Now().Unix()
+	name := "opencode/" + model
+	var out *sseWriter
+	if wantStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(200)
+		out = &sseWriter{w: w}
+		out.chunk(openaiChunk(id, created, name, map[string]any{"role": "assistant", "content": ""}, nil))
+	}
+
+	// Poll the client: text grows into the answer, and a tool call the plugin
+	// recorded ends the turn — the caller runs that tool, not the client.
+	var last string
+	var calls []bridge.ToolCall
+	var snap clientapi.Snapshot
+	quiet := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-time.After(s.pollGap):
+		}
+		if err != nil {
+			break
+		}
+		snap, err = s.ClientAPI.Snapshot(ctx, sessionID)
+		if err != nil {
+			break
+		}
+		if len(snap.Text) > len(last) {
+			if out != nil {
+				out.chunk(openaiChunk(id, created, name, map[string]any{"content": snap.Text[len(last):]}, nil))
+			}
+			last = snap.Text
+			quiet = time.Now()
+		}
+		if s.BridgeDir != "" {
+			if found := bridge.Calls(s.BridgeDir, sessionID); len(found) > 0 {
+				calls = found
+				break
+			}
+		}
+		if snap.Idle || (last != "" && time.Since(quiet) > idleGrace) {
+			break
+		}
+	}
+	if snap.Idle {
+		// the answer is over; the usage the client counted rides along
+	} else if last == "" && len(calls) == 0 {
+		if err == nil {
+			err = fmt.Errorf("client stopped without an answer")
+		}
+		clientError(w, err)
+		return
+	}
+
+	finish := finishReason(snap.Outcome, len(calls))
+	if wantStream {
+		if len(calls) > 0 {
+			for i, c := range calls {
+				out.chunk(openaiChunk(id, created, name, map[string]any{
+					"tool_calls": []any{map[string]any{"index": i, "id": c.ID, "type": "function",
+						"function": map[string]any{"name": c.Name, "arguments": ""}}}}, nil))
+				out.chunk(openaiChunk(id, created, name, map[string]any{
+					"tool_calls": []any{map[string]any{"index": i, "function": map[string]any{"arguments": string(c.Arguments)}}}}, nil))
+			}
+		}
+		out.chunk(openaiChunk(id, created, name, map[string]any{}, &finish))
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		out.flush()
+		return
+	}
+	msg := map[string]any{"role": "assistant", "content": last}
+	if len(calls) > 0 {
+		msg["tool_calls"] = openAIToolCalls(calls)
+		if last == "" {
+			msg["content"] = nil
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id": id, "object": "chat.completion", "created": created, "model": name,
+		"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+		"usage":   openAIUsage(snap.Usage),
+	})
+}
+
+const idleGrace = 3 * time.Second
+
+func openaiChunk(id string, created int64, model string, delta map[string]any, finish *string) map[string]any {
+	var fr any
+	if finish != nil {
+		fr = *finish
+	}
+	return map[string]any{
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": fr}},
+	}
+}
+
+func openAIToolCalls(calls []bridge.ToolCall) []any {
+	out := make([]any, 0, len(calls))
+	for _, c := range calls {
+		args := string(c.Arguments)
+		if args == "" {
+			args = "{}"
+		}
+		out = append(out, map[string]any{
+			"id": c.ID, "type": "function",
+			"function": map[string]any{"name": c.Name, "arguments": args},
+		})
+	}
+	return out
+}
+
+// chatRequest is the caller's request, flattened into what the plugin needs.
+type chatRequest struct {
+	Prompt   string
+	System   string
+	Messages []bridge.Message
+	Tools    []bridge.Tool
+	Variant  string
+}
+
+// parseChatRequest reads an openai chat body: the last user text becomes the
+// prompt that wakes the client, everything else travels through the spool.
+func parseChatRequest(chat map[string]any) chatRequest {
+	var out chatRequest
+	out.Variant, _ = chat["reasoning_effort"].(string)
+	msgs, _ := chat["messages"].([]any)
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		role, _ := mm["role"].(string)
+		text := messageText(mm["content"])
+		switch role {
+		case "system", "developer":
+			if out.System != "" {
+				out.System += "\n\n"
+			}
+			out.System += text
+		case "assistant":
+			am := bridge.Message{Role: "assistant", Content: text}
+			if tcs, ok := mm["tool_calls"].([]any); ok {
+				for _, tc := range tcs {
+					t, _ := tc.(map[string]any)
+					fn, _ := t["function"].(map[string]any)
+					name, _ := fn["name"].(string)
+					args, _ := fn["arguments"].(string)
+					id, _ := t["id"].(string)
+					am.ToolCalls = append(am.ToolCalls, bridge.ToolCall{ID: id, Name: name, Arguments: json.RawMessage(args)})
+				}
+			}
+			out.Messages = append(out.Messages, am)
+			if text != "" {
+				out.Prompt = text
+			}
+		case "tool":
+			id, _ := mm["tool_call_id"].(string)
+			out.Messages = append(out.Messages, bridge.Message{Role: "tool", Content: text, ToolCallID: id})
+		default:
+			out.Messages = append(out.Messages, bridge.Message{Role: "user", Content: text})
+			if text != "" {
+				out.Prompt = text
+			}
+		}
+	}
+	if tools, ok := chat["tools"].([]any); ok {
+		for _, t := range tools {
+			tm, _ := t.(map[string]any)
+			fn, _ := tm["function"].(map[string]any)
+			if fn == nil {
+				fn = tm
+			}
+			name, _ := fn["name"].(string)
+			if name == "" {
+				continue
+			}
+			desc, _ := fn["description"].(string)
+			params, _ := json.Marshal(fn["parameters"])
+			if string(params) == "null" {
+				params = json.RawMessage(`{"type":"object","properties":{}}`)
+			}
+			out.Tools = append(out.Tools, bridge.Tool{Name: name, Description: desc, Parameters: params})
+		}
+	}
+	return out
+}
+
+// finishReason maps the client's outcome onto an openai finish reason.
+func finishReason(outcome string, calls int) string {
+	if calls > 0 {
+		return "tool_calls"
+	}
+	if outcome != "" && outcome != "succeeded" {
+		return "error"
+	}
+	return "stop"
+}
+
+func clientError(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_, _ = io.WriteString(w, `{"error":{"type":"client_upstream_error","message":`+quote(err.Error())+`}}`)
+}
+
+func quote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func openAIUsage(u clientapi.Usage) map[string]any {
+	return map[string]any{
+		"prompt_tokens":             u.Input,
+		"completion_tokens":         u.Output,
+		"total_tokens":              u.Input + u.Output,
+		"prompt_tokens_details":     map[string]any{"cached_tokens": u.CacheRead},
+		"completion_tokens_details": map[string]any{"reasoning_tokens": u.Reasoning},
+	}
+}
+
+func messageText(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []any:
+		var b strings.Builder
+		for _, p := range t {
+			pm, _ := p.(map[string]any)
+			if s, _ := pm["text"].(string); s != "" {
+				b.WriteString(s)
+			}
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// sseWriter frames one openai chunk per event and flushes it, so tokens reach
+// the caller while the model is still talking.
+type sseWriter struct {
+	w  http.ResponseWriter
+	fl http.Flusher
+}
+
+func (s *sseWriter) chunk(v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", b)
+	s.flush()
+}
+
+func (s *sseWriter) flush() {
+	if s.fl == nil {
+		s.fl, _ = s.w.(http.Flusher)
+	}
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+func randHex(n int) string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strings.Repeat("0", n)
+	}
+	return hex.EncodeToString(b[:])[:n]
 }
 
 // fingerprintChat prepares a native chat body for the free gate.

@@ -1,5 +1,19 @@
 # examples
 
+## lanvello-bridge.ts
+
+the client-side half of the `serve` bridge: copy it into
+`~/.config/opencode/plugins/` and the caller's own system prompt, history and
+tool schemas travel into the client's session, from the spool `serve` writes
+under `<dataDir>/bridge/`. the caller's tools are injected into the client's
+tool set — replacing the client's own, so a tool-less api request runs nothing
+in the client's directory — and a call the model makes is recorded for the
+gateway and blocked inside the client instead of being executed there: the api
+caller gets it back as an openai `tool_calls` turn and runs it itself.
+
+the spool directory is `$LANVELLO_BRIDGE_DIR`, defaulting to the gateway's own
+`<dataDir>/bridge`, so a moved data dir moves both ends.
+
 ## lanvello-ext.mjs
 
 pi-family provider extension (omp, prime-agent) pointing at a local
