@@ -1,11 +1,50 @@
 # lanvello
 
-one local port serving opencode free models over an openai-compatible api.
-no login, no api keys from you: lanvello replays the official client
-fingerprint (`opencode/*` user-agent, `x-opencode-*` session headers,
-forced streaming, bash/glob/grep/read tool quartet) against
-`https://opencode.ai/zen/v1` with `Bearer public`, exactly like the cli
-does for its free tier. tor lanes rotate exits when an ip is throttled.
+one binary, two ways at opencode's free models, egress always through tor lanes.
+
+**`lanvello proxy` — the mode that works.** a local http proxy the real opencode
+client is pointed at. opencode leases a free-tier session to the *running client*
+and to nobody else: replaying the fingerprint (user-agent, `x-opencode-*`, tool
+set) gets `403 FreeTierError`, and so does a session id copied from a live run,
+even seconds later on the same machine. so the client keeps making its own calls
+and the lanes move underneath it — a 429 on a spent exit parks that exit for the
+reset window the far end named and replays the very same request on another one.
+
+**`lanvello serve` — the openai-compatible api.** it serves free models again,
+but not by replaying the client's fingerprint: the free tier leases its session
+to the running opencode client, so `serve` asks that client to make the call and
+translates the answer back into openai shapes (streamed chunks included).
+
+```
+./bin/lanvello serve --listen 127.0.0.1:11434 --lanes 5
+inference: opencode client at http://127.0.0.1:49374 (the free-tier session lives there)
+```
+
+- `/v1/models` lists what the client itself can drive (its own list, current).
+- `/v1/chat/completions` runs the caller's messages through a client session,
+  created per request and dropped again, so the client's session list stays
+  clean. `stream:false` aggregates; `stream:true` relays deltas as they arrive.
+- one request per client session means requests are concurrent, and different
+  models can be asked for in parallel (each session is pinned to its model).
+- the caller's own system prompt, history and tool definitions cross the
+  boundary through a spool: `serve` parks the request at
+  `<dataDir>/bridge/<sessionId>.json` next to the session it created, and a
+  plugin inside the client — `examples/lanvello-bridge.ts`, installed in
+  `~/.config/opencode/plugins/` — rebuilds the model call from it, so the
+  answer comes from the caller's prompt and the caller's tools, not the
+  client's. without the plugin the bridge still answers, with the client's own
+  agent and its own tools.
+- tools are the api caller's to run. the plugin injects the caller's schemas
+  into the client (replacing the client's own, so a tool-less api request
+  cannot run anything in the client's directory), blocks the call the model
+  makes, records it, and `serve` returns it as an openai `tool_calls` answer
+  with `finish_reason: "tool_calls"` — including when the caller asked for
+  `stream:true`. the caller appends the result as a `role: "tool"` message and
+  the next request carries it back into the client.
+- `--client` makes a missing client fatal; `--no-client` keeps the old replay
+  path, which the free tier answers with `403 FreeTierError` (see the notes at
+  the bottom). without a client, `serve` says so on startup instead of serving
+  errors.
 
 ## install
 
@@ -31,6 +70,7 @@ go build -o bin/lanvello ./cmd/lanvello
 ./bin/lanvello key add --name aider   # prints sk-lanv-... once + baseURL hint
 ./bin/lanvello lanes status
 ./bin/lanvello tui
+cp examples/lanvello-bridge.ts ~/.config/opencode/plugins/   # serve: caller's prompt + tools
 ```
 
 any harness that accepts an openai-compatible provider then uses:
@@ -40,6 +80,62 @@ baseURL: http://127.0.0.1:11434/v1
 apiKey:  sk-lanv-...
 model:   opencode/muse-spark-1.3-contributor-free
 ```
+
+## proxy
+
+```
+./bin/lanvello proxy --listen 127.0.0.1:8888 --lanes 5
+./bin/lanvello proxy --print-ca      # the CA path, for NODE_EXTRA_CA_CERTS
+```
+
+point the client at it (the proxy prints both lines on start):
+
+```
+HTTPS_PROXY=http://[IP_ADDRESS]:8888 \
+NODE_EXTRA_CA_CERTS=~/.local/state/lanvello/ca.pem \
+opencode
+```
+
+the long-running client daemon — `opencode serve --service`, the process
+`lanvello serve` drives — needs the same variables where *it* is started,
+plus loopback kept out of the proxy:
+
+```
+NO_PROXY=127.0.0.1,localhost,::1 \
+HTTPS_PROXY=http://[IP_ADDRESS]:8888 \
+NODE_EXTRA_CA_CERTS=~/.local/state/lanvello/ca.pem \
+opencode serve --service
+```
+
+a daemon launched without the proxy answers `403 FreeTierError` to every
+session it runs, and that is the error `serve` hands back. a daemon launched
+*with* the proxy but without `NO_PROXY` looks like something else again: the
+client calls its own api on `127.0.0.1`, those calls go out through a lane
+too, land on the exit's own loopback, and the session dies before it starts —
+the proxy log shows `tls handshake opencode.ai: EOF` and the client reports
+`getaddrinfo ETIMEOUT`.
+
+what happens on the wire:
+
+```
+opencode --CONNECT opencode.ai--> lanvello proxy
+                                    |  tls terminated with a ca minted in the data dir
+                                    |  request replayed per lane
+                                    +--> lane 2 {de} --socks--> opencode.ai  200
+                                    +--> 429 retry-after 8760 -> lane 2 parked 146m, replay lane 3 {se}  200
+```
+
+- `--print-ca` prints `ca.pem`; the client only ever sees a leaf minted for the
+  host it asked for, and the CA never leaves the data dir.
+- 429, 502, 503 and 504 park the exit for as long as the far end's
+  `retry-after` says (up to 6h) and replay the same request on the next lane
+  *before* a byte reaches the client: a spent exit costs a retry, not a failure.
+  `--quiet` drops the per-request lane log.
+- `socks: ["127.0.0.1:52001", ...]` in the config reuses lanes someone else
+  spawned (a running `lanvello serve`, say); without it the proxy spawns its own
+  tor, exactly like serve.
+- loopback targets bypass the lanes: the client's own local server is not
+  the internet, and tor would refuse it anyway.
 
 ## endpoints
 
@@ -184,3 +280,37 @@ docker run --rm -p 127.0.0.1:11434:11434 \
 
 see `deploy/lanvello.service` for systemd.
 override target with `LANVELLO_BASE_URL` if zen ever moves.
+
+## reverse-engineering notes (2026-10-13)
+
+what the official client does today, read off the running binary and the live
+wire — the next person to touch the free tier needs this:
+
+- the provider moved: `https://models.opencode.ai/api.json` now serves
+  `"api": "https://opencode.ai/inference/v1"` for provider `opencode`. `/zen/v1`
+  still answers but it is the older path; the client uses `/inference/v1`.
+- request shape: user agent `opencode/<channel>/<version>/<client>` (today
+  `opencode/dev/0.0.0-dev-20455/cli`), `authorization: Bearer public`,
+  `x-opencode-client`, `x-opencode-project`, `x-opencode-session` (the root
+  session id), `x-opencode-session-id`, `x-session-affinity`, `x-session-id`,
+  `b3` and `traceparent`.
+- session ids are minted locally: `ses_` + `hex48(~(Date.now()*4096+counter))`
+  + 14 base62 characters from random bytes. there is no signature in them; the
+  timestamp decodes back to the moment the session was made (counter 1).
+- the model transport is a websocket (`@opencode/SessionModelTransport`,
+  55 minute rotation, 15s connect budget, plain http after 5 stream failures);
+  the free models are served over plain http today.
+- the gate is a server-side lease on the session, not a fingerprint: bytes
+  replayed from another process — same headers in the same order and case, same
+  body, the client's own TLS stack, same machine — answer `403 FreeTierError`,
+  while the same bytes carrying the client's own session answer `200`. no
+  header, tool set, body, protocol, exit or address moves that line, and the
+  lease does not survive the client's request (a session id taken off the wire
+  is refused seconds later). this is why `proxy` exists and why `serve` cannot
+  come back.
+- the free list moved with it: `fledge-alpha-free` answers RegionError,
+  `mimo-v2.5-free` and `exo-free` are deprecated (410); current free ids include
+  `mimo-v2.6-flash-free`, `step-5-preview-free`, `cat-jam-free`,
+  `muse-spark-1.3-contributor-free`, `nemotron-3-ultra-free`,
+  `nemotron-3.5-lightning-free`, `space-bunny-free`, `ling-3.0/3.1-flash`.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                

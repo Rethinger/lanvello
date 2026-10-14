@@ -90,3 +90,24 @@ func TestRotateHookAndDone(t *testing.T) {
 		t.Fatalf("RotateDone not applied: %+v", ls[0])
 	}
 }
+
+// A 429 carries the far end's own reset window and it is often hours wide:
+// retiring an exit for less than that hands the same spent address straight
+// back to the next request.
+func TestNoteLimitedHonorsRetryAfter(t *testing.T) {
+	m := lanes.New(t.TempDir(), []string{"de"}, nil, nil, true, 1)
+	l := m.Lanes()[0]
+
+	until := m.NoteLimited(l, 146*time.Minute)
+	if d := time.Until(until); d < 145*time.Minute || d > 147*time.Minute {
+		t.Fatalf("146m retry-after retired the exit for %s", d)
+	}
+	until = m.NoteLimited(l, 0)
+	if d := time.Until(until); d < 9*time.Minute || d > 11*time.Minute {
+		t.Fatalf("missing retry-after fell back to %s, want about 10m", d)
+	}
+	until = m.NoteLimited(l, 400*time.Hour)
+	if d := time.Until(until); d > 6*time.Hour+time.Minute {
+		t.Fatalf("a bogus retry-after parked the exit for %s, want at most 6h", d)
+	}
+}

@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// maxRetire caps how long a spent exit is parked: long enough to respect the
+// far end's own reset window (they are often measured in hours), short enough
+// that a lane cannot be parked forever by a bogus header.
+const maxRetire = 6 * time.Hour
+
 type Lane struct {
 	Index       int
 	Country     string
@@ -261,9 +266,15 @@ func (m *Manager) NoteResult(country string, status int) {
 func (m *Manager) NoteLimited(l *Lane, retryAfter time.Duration) time.Time {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	span := 10 * time.Minute
-	if retryAfter > 0 && retryAfter < span {
-		span = retryAfter
+	// The far end knows its own window and it is often hours wide: retiring
+	// the exit for less than it asked hands the same spent address straight
+	// back to the next request, which is how a free tier turns into a wall.
+	span := retryAfter
+	if span <= 0 {
+		span = 10 * time.Minute
+	}
+	if span > maxRetire {
+		span = maxRetire
 	}
 	l.LimitedTill = time.Now().Add(span)
 	l.Score--
